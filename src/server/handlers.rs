@@ -6,6 +6,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use tokio_stream::StreamExt;
 
 pub async fn store_artifact<T: StorageProvider>(
     Path(hash): Path<String>,
@@ -18,14 +19,17 @@ pub async fn store_artifact<T: StorageProvider>(
         return Ok((StatusCode::CONFLICT, "Cannot override an existing record"));
     }
 
-    // For now, let's use a simpler approach - collect the body into bytes
-    // TODO: Implement true streaming later for better memory efficiency
-    let bytes = axum::body::to_bytes(body, usize::MAX)
-        .await
-        .map_err(|_| ServerError::BadRequest)?;
-
-    let cursor = std::io::Cursor::new(bytes);
-    let reader_stream = tokio_util::io::ReaderStream::new(cursor);
+    // Stream the request body straight into storage without buffering the
+    // whole artifact in memory - `axum::body::to_bytes` (the old approach)
+    // would defeat the point of infra/aws.rs's multipart streaming below it.
+    // A read error here (client disconnected/reset) surfaces as
+    // `std::io::Error` and is turned into `StorageError::ClientAbort` by the
+    // storage layer, not a 500 - see infra/aws.rs and server/error.rs.
+    let body_stream = body
+        .into_data_stream()
+        .map(|chunk| chunk.map_err(std::io::Error::other));
+    let reader = tokio_util::io::StreamReader::new(body_stream);
+    let reader_stream = tokio_util::io::ReaderStream::new(reader);
 
     state.storage.store(&hash, reader_stream).await?;
 

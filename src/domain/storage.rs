@@ -11,6 +11,12 @@ pub enum StorageError {
     AlreadyExists,
     #[error("Storage operation failed")]
     OperationFailed,
+    /// The client disconnected/reset the request body stream mid-upload.
+    /// This is distinct from `OperationFailed` because it is never our fault
+    /// (nothing on the server side went wrong) and must not be reported to
+    /// nx/operators as a 5xx - see server/error.rs mapping.
+    #[error("Client aborted upload")]
+    ClientAbort,
 }
 
 #[async_trait]

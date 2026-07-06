@@ -23,9 +23,11 @@ Access to AWS S3 (or S3-compatible service like MinIO)
 ### Installation
 
 #### Step 1: Download the binary
+
 Go to [Releases page](https://github.com/nxcite/nx-cache-server/releases) and download the binary for your operating system.
 
 Alternatively, use command line tools:
+
 ```bash
 # Using curl
 curl -L https://github.com/nxcite/nx-cache-server/releases/download/<VERSION>/nx-cache-aws-<VERSION>-<PLATFORM> -o nx-cache-aws
@@ -39,6 +41,7 @@ wget https://github.com/nxcite/nx-cache-server/releases/download/<VERSION>/nx-ca
 ```
 
 #### Step 2: Make executable (Linux/macOS only)
+
 ```bash
 chmod +x nx-cache-aws
 ```
@@ -48,6 +51,7 @@ chmod +x nx-cache-aws
 The server supports configuration via environment variables, command-line arguments, or both.
 
 ##### Option A: Environment Variables (Recommended)
+
 ```bash
 # Required
 export S3_BUCKET_NAME="your-s3-bucket-name"
@@ -69,6 +73,7 @@ export BIND_ADDRESS="0.0.0.0"                   # IP to bind to (default: 0.0.0.
 ```
 
 ##### Option B: Command Line Arguments
+
 ```bash
 ./nx-cache-aws \
   --region "your-aws-region" \
@@ -84,7 +89,9 @@ export BIND_ADDRESS="0.0.0.0"                   # IP to bind to (default: 0.0.0.
 ```
 
 ##### Option C: Mixed Configuration
+
 You can also combine both methods. Command line arguments will override environment variables:
+
 ```bash
 # Set common config via environment
 export AWS_REGION="us-west-2"
@@ -98,14 +105,17 @@ export SERVICE_ACCESS_TOKEN="my-secure-token"
 > **Note:** AWS credentials and region are optional when running on AWS infrastructure (EC2, ECS, Lambda) or when AWS config files are present. The server will auto-discover them from your environment.
 
 #### Step 4: Run the server
+
 ```bash
 ./nx-cache-aws
 ```
 
 #### Step 5 (optional): Verify the service is up and running
+
 ```bash
 curl http://localhost:3000/health
 ```
+
 You should receive an "OK" response.
 
 ### Client Configuration
@@ -127,12 +137,46 @@ Once configured, Nx will automatically use your cache server for storing and ret
 
 For more details, see the [Nx documentation](https://nx.dev/recipes/running-tasks/self-hosted-caching#usage-notes).
 
+## Observability & Diagnosability
+
+This fork's operating rule: **`RUST_LOG=nx_cache_server=info` must be sufficient to fully diagnose any 4xx/5xx response, without ever needing debug logging.** This matters because enabling debug logging on the whole AWS SDK (`RUST_LOG=debug`) generates enough volume to rotate out of a small log window in a couple of minutes on a busy cache server - exactly what happened during an incident that motivated this section.
+
+At INFO level you get:
+
+- **One access-log line per request** (method, path, status, `duration_ms`, and `bytes` when a `Content-Length` is set) - so you can always tell whether/when/how a request finished.
+- **One structured error line per failure**, carrying `operation` (`head`/`get`/`put`/`multipart-create`/`multipart-part`/`multipart-complete`/`multipart-abort`), the cache object hash, and the AWS SDK's own request id(s) plus the full error detail - enough to open an AWS support case or match logs to an S3-side incident without re-running anything at debug.
+- **Client-side aborts are logged at `WARN`, not `ERROR`**, and answered with `400 Bad Request` instead of `500`. A client disconnecting or resetting mid-upload is not a server failure and must not page anyone or count toward server error budgets.
+
+Run with, e.g.:
+
+```bash
+export RUST_LOG="nx_cache_server=info"
+```
+
+## Uploads: Multipart Streaming & S3 Lifecycle Cleanup
+
+PUT bodies are streamed to S3 in ~8MiB chunks. Small bodies use a single `PutObject`; anything larger uses S3 multipart upload (`CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload`), so the server never buffers more than roughly one part of a (potentially multi-GB) build artifact in memory at a time. If any part fails to upload (including the client disconnecting mid-stream), the in-progress multipart upload is aborted via `AbortMultipartUpload`.
+
+**Recommended:** because a process crash, network partition, or bug could in principle still leave an incomplete multipart upload behind (incomplete parts are billed S3 storage with no object to show for it), add an [S3 Lifecycle rule](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html#mpu-abort-incomplete-mpu-lifecycle-config) to the cache bucket that expires incomplete multipart uploads after a few days, e.g.:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "abort-incomplete-multipart-uploads",
+      "Status": "Enabled",
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 3 }
+    }
+  ]
+}
+```
+
+This makes cleanup self-healing even in failure modes the server-side abort can't reach (e.g. the process being killed before it runs).
+
 ---
 
-### Stay Updated. Watch this repository to get notified about new releases!
+### Stay Updated. Watch this repository to get notified about new releases
 
 <img width="369" height="387" alt="image" src="https://github.com/user-attachments/assets/97c4ebab-75a1-4f83-bc52-cf4ebbc73bfa" />
 
 <img width="465" height="366" alt="image" src="https://github.com/user-attachments/assets/512af549-0e9a-40ac-95bd-f9eea0da38a7" />
-
-

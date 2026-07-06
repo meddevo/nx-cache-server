@@ -7,11 +7,14 @@ use aws_config::meta::region::{ProvideRegion, RegionProviderChain};
 use aws_config::profile::region::ProfileFileRegionProvider;
 use aws_config::provider_config::ProviderConfig;
 use aws_credential_types::provider::future::ProvideCredentials as ProvideCredentialsFuture;
+use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::config::SharedHttpClient;
 use aws_sdk_s3::config::{Credentials, ProvideCredentials};
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::operation::{RequestId, RequestIdExt};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::{config::Region, Client, Config as S3Config};
 use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
 use aws_smithy_http_client::{tls, Builder as HttpClientBuilder};
@@ -24,6 +27,33 @@ use crate::domain::{
     config::{ConfigError, ConfigValidator},
     storage::{StorageError, StorageProvider},
 };
+
+/// S3 multipart part size. Parts below this go through a single PutObject;
+/// at/above it we switch to CreateMultipartUpload/UploadPart/Complete so we
+/// never hold more than ~one part of a (potentially multi-GB) artifact in
+/// memory at once. Must stay >= S3's 5MiB multipart part minimum.
+const MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
+
+/// Logs an S3 SDK error with everything an operator needs from a single INFO
+/// (well, ERROR)-level line: which operation, which cache object, the full
+/// SDK error (service code/message via Debug), and the AWS request id(s) so
+/// AWS support can look it up. This is the fix for the 2026-07-06 incident
+/// where diagnosing a 500 required RUST_LOG=debug on the whole SDK.
+fn log_s3_error<E, R>(operation: &str, hash: &str, err: &aws_sdk_s3::error::SdkError<E, R>)
+where
+    E: std::fmt::Debug,
+    R: std::fmt::Debug,
+    aws_sdk_s3::error::SdkError<E, R>: RequestId + RequestIdExt,
+{
+    tracing::error!(
+        operation,
+        hash,
+        request_id = err.request_id(),
+        extended_request_id = err.extended_request_id(),
+        error = ?err,
+        "S3 operation failed"
+    );
+}
 
 /// HTTPS client backed by rustls + ring.
 ///
@@ -190,9 +220,18 @@ impl S3Storage {
             .http_client(https_client())
             .region(region)
             .credentials_provider(config.clone())
+            // Adaptive retry mode self-heals transient S3 blips (throttling,
+            // 5xx, socket resets) inside the SDK instead of surfacing them to
+            // nx as a fatal build error. operation_attempt_timeout bounds a
+            // single attempt (~10s); operation_timeout (below, per-call) is
+            // the overall per-S3-call budget - each UploadPart/PutObject call
+            // gets its own budget, so large artifacts aren't capped by a
+            // single 10s window across the whole multipart upload.
+            .retry_config(RetryConfig::adaptive().with_max_attempts(3))
             .timeout_config(
                 TimeoutConfig::builder()
                     .operation_timeout(std::time::Duration::from_secs(config.timeout_seconds))
+                    .operation_attempt_timeout(std::time::Duration::from_secs(10))
                     .build(),
             );
 
@@ -214,6 +253,41 @@ impl S3Storage {
     }
 }
 
+/// Reads from `data` into a buffer until it reaches `part_size` bytes or the
+/// stream ends, returning `(buffer, eof)`. This is the boundary math that
+/// decides simple-PutObject vs multipart in `store()` below, factored out so
+/// it's unit-testable against a plain in-memory `AsyncRead` - no AWS SDK
+/// mocking required. A stream read error means the client disconnected/reset
+/// mid-upload, which is logged at WARN (not an S3/server failure) and
+/// surfaced as `StorageError::ClientAbort` so the caller maps it to a 4xx.
+async fn fill_part<R: AsyncRead + Send + Unpin>(
+    data: &mut ReaderStream<R>,
+    part_size: usize,
+    hash: &str,
+    bytes_received: &mut usize,
+) -> Result<(Vec<u8>, bool), StorageError> {
+    let mut buffer = Vec::with_capacity(part_size);
+    while buffer.len() < part_size {
+        match data.next().await {
+            Some(Ok(chunk)) => {
+                *bytes_received += chunk.len();
+                buffer.extend_from_slice(&chunk);
+            }
+            Some(Err(e)) => {
+                tracing::warn!(
+                    hash,
+                    bytes_received = *bytes_received,
+                    error = %e,
+                    "client aborted PUT body stream"
+                );
+                return Err(StorageError::ClientAbort);
+            }
+            None => return Ok((buffer, true)),
+        }
+    }
+    Ok((buffer, false))
+}
+
 #[async_trait]
 impl StorageProvider for S3Storage {
     async fn exists(&self, hash: &str) -> Result<bool, StorageError> {
@@ -226,13 +300,13 @@ impl StorageProvider for S3Storage {
             .await
         {
             Ok(_) => Ok(true),
-            Err(e) => match e.into_service_error() {
-                HeadObjectError::NotFound(_) => Ok(false),
-                other => {
-                    tracing::error!("S3 head_object failed: {:?}", other);
-                    Err(StorageError::OperationFailed)
+            Err(e) => {
+                if matches!(e.as_service_error(), Some(HeadObjectError::NotFound(_))) {
+                    return Ok(false);
                 }
-            },
+                log_s3_error("head", hash, &e);
+                Err(StorageError::OperationFailed)
+            }
         }
     }
 
@@ -245,27 +319,157 @@ impl StorageProvider for S3Storage {
             return Err(StorageError::AlreadyExists);
         }
 
-        // For simplicity, read all data into memory first
-        // TODO: Implement true streaming for better memory efficiency
-        let mut buffer = Vec::new();
-        while let Some(chunk) = data.next().await {
-            let chunk = chunk.map_err(|_| StorageError::OperationFailed)?;
-            buffer.extend_from_slice(&chunk);
+        // Fill one part's worth of the body before deciding how to upload it.
+        // Bodies that fit in a single part use plain PutObject; larger bodies
+        // switch to multipart so we never buffer more than ~one part of a
+        // (potentially multi-GB) artifact in memory (replaces the old
+        // read-everything-into-a-Vec approach).
+        let mut bytes_received: usize = 0;
+        let (mut buffer, mut eof) =
+            fill_part(&mut data, MULTIPART_PART_SIZE, hash, &mut bytes_received).await?;
+
+        if eof {
+            // Whole body fit in one part: simple PutObject, no multipart
+            // bookkeeping (and nothing to ever abort/leak).
+            let body = aws_sdk_s3::primitives::ByteStream::from(buffer);
+            return self
+                .client
+                .put_object()
+                .bucket(&self.bucket_name)
+                .key(hash)
+                .body(body)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    log_s3_error("put", hash, &e);
+                    StorageError::OperationFailed
+                });
         }
 
-        let body = aws_sdk_s3::primitives::ByteStream::from(buffer);
-
-        self.client
-            .put_object()
+        // Body exceeds one part - go multipart. `buffer` is ~MULTIPART_PART_SIZE
+        // bytes at this point (the loop above only exits early via `eof`,
+        // handled above).
+        let create = self
+            .client
+            .create_multipart_upload()
             .bucket(&self.bucket_name)
             .key(hash)
-            .body(body)
             .send()
             .await
             .map_err(|e| {
-                tracing::error!("S3 put_object failed: {:?}", e);
+                log_s3_error("multipart-create", hash, &e);
                 StorageError::OperationFailed
             })?;
+
+        let upload_id = match create.upload_id() {
+            Some(id) => id.to_string(),
+            None => {
+                tracing::error!(
+                    operation = "multipart-create",
+                    hash,
+                    "S3 create_multipart_upload returned no upload_id"
+                );
+                return Err(StorageError::OperationFailed);
+            }
+        };
+
+        let mut completed_parts: Vec<CompletedPart> = Vec::new();
+        let mut part_number: i32 = 1;
+
+        // Upload parts until the stream is drained. Any failure (client abort
+        // or S3 error) breaks out of this block so we can always reach the
+        // AbortMultipartUpload cleanup below - an incomplete multipart upload
+        // left dangling in S3 is billed storage with nothing to show for it.
+        let upload_result: Result<(), StorageError> = async {
+            loop {
+                let part_body = std::mem::take(&mut buffer);
+                if !part_body.is_empty() {
+                    let part_len = part_body.len();
+                    let res = self
+                        .client
+                        .upload_part()
+                        .bucket(&self.bucket_name)
+                        .key(hash)
+                        .upload_id(&upload_id)
+                        .part_number(part_number)
+                        .content_length(part_len as i64)
+                        .body(aws_sdk_s3::primitives::ByteStream::from(part_body))
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            log_s3_error("multipart-part", hash, &e);
+                            StorageError::OperationFailed
+                        })?;
+
+                    let e_tag = res.e_tag().ok_or_else(|| {
+                        tracing::error!(
+                            operation = "multipart-part",
+                            hash,
+                            part_number,
+                            "S3 upload_part response missing ETag"
+                        );
+                        StorageError::OperationFailed
+                    })?;
+
+                    completed_parts.push(
+                        CompletedPart::builder()
+                            .part_number(part_number)
+                            .e_tag(e_tag)
+                            .build(),
+                    );
+                    part_number += 1;
+                }
+
+                if eof {
+                    break;
+                }
+
+                let (next_buffer, next_eof) =
+                    fill_part(&mut data, MULTIPART_PART_SIZE, hash, &mut bytes_received).await?;
+                buffer = next_buffer;
+                eof = next_eof;
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = upload_result {
+            if let Err(abort_err) = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.bucket_name)
+                .key(hash)
+                .upload_id(&upload_id)
+                .send()
+                .await
+            {
+                // We're already returning an error; the abort failing on top
+                // means S3 is left holding a dangling multipart upload (billed
+                // storage, no object). Log loudly so it can be cleaned up
+                // manually - see README for the recommended lifecycle rule
+                // that makes this self-healing.
+                log_s3_error("multipart-abort", hash, &abort_err);
+            }
+            return Err(err);
+        }
+
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket_name)
+            .key(hash)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed_parts))
+                    .build(),
+            )
+            .send()
+            .await
+            .inspect_err(|e| {
+                log_s3_error("multipart-complete", hash, e);
+            })
+            .map_err(|_| StorageError::OperationFailed)?;
 
         Ok(())
     }
@@ -281,15 +485,106 @@ impl StorageProvider for S3Storage {
             .key(hash)
             .send()
             .await
-            .map_err(|e| match e.into_service_error() {
-                GetObjectError::NoSuchKey(_) => StorageError::NotFound,
-                other => {
-                    tracing::error!("S3 get_object failed: {:?}", other);
-                    StorageError::OperationFailed
+            .map_err(|e| {
+                if matches!(e.as_service_error(), Some(GetObjectError::NoSuchKey(_))) {
+                    return StorageError::NotFound;
                 }
+                log_s3_error("get", hash, &e);
+                StorageError::OperationFailed
             })?;
 
         // Direct streaming - no buffering
         Ok(Box::new(result.body.into_async_read()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
+
+    /// An AsyncRead that always fails - simulates a client disconnecting or
+    /// resetting the connection mid-upload, without needing a real socket or
+    /// the AWS SDK.
+    struct FailingReader;
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other("connection reset by peer")))
+        }
+    }
+
+    #[tokio::test]
+    async fn fill_part_returns_full_buffer_and_eof_when_body_smaller_than_part_size() {
+        let cursor = std::io::Cursor::new(vec![1u8, 2, 3, 4, 5]);
+        let mut stream = ReaderStream::new(cursor);
+        let mut bytes_received = 0usize;
+
+        let (buffer, eof) = fill_part(&mut stream, 1024, "test-hash", &mut bytes_received)
+            .await
+            .expect("should succeed");
+
+        assert!(eof, "body smaller than part_size must report eof");
+        assert_eq!(buffer, vec![1, 2, 3, 4, 5]);
+        assert_eq!(bytes_received, 5);
+    }
+
+    #[tokio::test]
+    async fn fill_part_stops_at_part_size_boundary_without_eof() {
+        let data = vec![7u8; 30];
+        let cursor = std::io::Cursor::new(data.clone());
+        let mut stream = ReaderStream::new(cursor);
+        let mut bytes_received = 0usize;
+
+        let (buffer, eof) = fill_part(&mut stream, 10, "test-hash", &mut bytes_received)
+            .await
+            .expect("should succeed");
+
+        // Must have flushed a full part and not yet hit the end of the stream.
+        assert!(!eof);
+        assert!(buffer.len() >= 10, "buffer should reach the part boundary");
+        assert!(buffer.len() <= data.len());
+        assert_eq!(bytes_received, buffer.len());
+    }
+
+    #[tokio::test]
+    async fn fill_part_on_empty_body_reports_eof_with_empty_buffer() {
+        let cursor = std::io::Cursor::new(Vec::<u8>::new());
+        let mut stream = ReaderStream::new(cursor);
+        let mut bytes_received = 0usize;
+
+        let (buffer, eof) = fill_part(&mut stream, 1024, "test-hash", &mut bytes_received)
+            .await
+            .expect("should succeed");
+
+        assert!(eof);
+        assert!(buffer.is_empty());
+        assert_eq!(bytes_received, 0);
+    }
+
+    #[tokio::test]
+    async fn fill_part_maps_stream_read_error_to_client_abort_not_operation_failed() {
+        let mut stream = ReaderStream::new(FailingReader);
+        let mut bytes_received = 0usize;
+
+        let result = fill_part(&mut stream, 1024, "test-hash", &mut bytes_received).await;
+
+        // A client-side disconnect must map to ClientAbort (-> 4xx), never
+        // OperationFailed (-> 500) - that's the whole point of fix #2.
+        assert!(matches!(result, Err(StorageError::ClientAbort)));
+    }
+
+    #[test]
+    fn multipart_part_size_meets_s3_minimum() {
+        // S3 requires every part except the last to be >= 5MiB. This is a
+        // `const`, so assert it via a const block to keep clippy happy while
+        // still catching a future accidental shrink below the S3 minimum.
+        const _: () = assert!(MULTIPART_PART_SIZE >= 5 * 1024 * 1024);
     }
 }
