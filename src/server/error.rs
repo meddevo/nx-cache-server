@@ -13,6 +13,9 @@ pub enum ServerError {
     #[error("Unauthorized")]
     Unauthorized,
 
+    #[error("Forbidden")]
+    Forbidden,
+
     #[error("Internal server error")]
     InternalError,
 
@@ -41,6 +44,7 @@ impl IntoResponse for ServerError {
             // HTTP-specific errors
             ServerError::BadRequest => (StatusCode::BAD_REQUEST, "Bad request"),
             ServerError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized"),
+            ServerError::Forbidden => (StatusCode::FORBIDDEN, "Forbidden"),
 
             // Generic fallback. Storage::OperationFailed (S3/head/get/put/multipart
             // failures) is already logged at ERROR with operation, hash, and the
@@ -87,5 +91,28 @@ mod tests {
     fn already_exists_maps_to_409() {
         let response = ServerError::Storage(StorageError::AlreadyExists).into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    // Nx rejects a bodyless 401/403 with "Misconfigured remote cache endpoint:
+    // Requests should respond with text/plain on 401s." Auth failures must carry
+    // a text/plain body, not a bare status - see server/middleware.rs.
+    #[test]
+    fn unauthorized_maps_to_401_text_plain() {
+        let response = ServerError::Unauthorized.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain"
+        );
+    }
+
+    #[test]
+    fn forbidden_maps_to_403_text_plain() {
+        let response = ServerError::Forbidden.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain"
+        );
     }
 }
