@@ -23,7 +23,8 @@ RUN --mount=type=cache,id=cargo-target-${TARGETPLATFORM},target=/app/target \
 # roots), no shell. Matches the "static binary, no shell" runtime expectation.
 FROM gcr.io/distroless/cc-debian12
 COPY --from=builder /nx-cache-aws /usr/local/bin/nx-cache-aws
-# Ensure request/startup logs (and TraceLayer's 5xx failures) are emitted.
+# Ensure startup logs, the per-request access-log line, and the structured
+# S3 error logs are emitted (all at INFO/ERROR - see server/middleware.rs).
 ENV RUST_LOG=info
 EXPOSE 3000
 ENTRYPOINT ["/usr/local/bin/nx-cache-aws"]
