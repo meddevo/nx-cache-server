@@ -1,9 +1,11 @@
 pub mod error;
 pub mod handlers;
 pub mod middleware;
+pub mod probe_cache;
 pub mod validation;
 
 use crate::domain::{config::ServerConfig, storage::StorageProvider};
+use crate::server::probe_cache::ProbeCache;
 use axum::{
     http::{header::CONNECTION, HeaderValue},
     middleware::{from_fn, from_fn_with_state},
@@ -17,6 +19,8 @@ use tower_http::set_header::SetResponseHeaderLayer;
 pub struct AppState<T: StorageProvider> {
     pub storage: Arc<T>,
     pub config: Arc<ServerConfig>,
+    /// Coalesces + short-TTL-caches GET existence probes (see probe_cache).
+    pub probe: Arc<ProbeCache>,
 }
 
 pub fn create_router<T: StorageProvider + Clone>(app_state: &AppState<T>) -> Router<AppState<T>> {
@@ -55,6 +59,7 @@ pub async fn run_server<T: StorageProvider + Clone>(
     let app_state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config.clone()),
+        probe: Arc::new(ProbeCache::default()),
     };
 
     let app = create_router::<T>(&app_state).with_state(app_state);
@@ -150,6 +155,7 @@ mod tests {
                 read_only_access_token: Some(RO_TOKEN.to_string()),
                 debug: false,
             }),
+            probe: Arc::new(ProbeCache::default()),
         };
         create_router(&state).with_state(state)
     }
@@ -238,7 +244,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_token_can_get() {
-        let response = app(MockStorage::new(ExistsBehavior::No))
+        // GET now probes existence first (Mode B fix), so a hit needs exists=Yes.
+        let response = app(MockStorage::new(ExistsBehavior::Yes))
             .oneshot(
                 Request::get("/v1/cache/abc123")
                     .header(header::AUTHORIZATION, format!("Bearer {}", RO_TOKEN))
@@ -248,6 +255,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_connection_close(&response);
+    }
+
+    #[tokio::test]
+    async fn get_missing_key_404_has_connection_close() {
+        // The existence probe reports absent -> 404, without ever calling
+        // `retrieve`. Nx treats 404 as a plain cache miss.
+        let response = app(MockStorage::new(ExistsBehavior::No))
+            .oneshot(
+                Request::get("/v1/cache/abc123")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", RO_TOKEN))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_connection_close(&response);
     }
 

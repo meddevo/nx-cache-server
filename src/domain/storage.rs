@@ -24,8 +24,13 @@ pub trait StorageProvider: Send + Sync + 'static {
     /// Check if an object exists at the given hash key
     async fn exists(&self, hash: &str) -> Result<bool, StorageError>;
 
-    /// Store data stream to storage at the given hash key
-    /// Returns error if object already exists
+    /// Store data stream to storage at the given hash key.
+    ///
+    /// The caller (the server handler) owns the existence check and only calls
+    /// this for a key it believes absent, so implementations must not assume
+    /// they're the first writer. Keys are content-addressed, so a racing
+    /// overwrite is byte-identical and harmless - do not re-add a pre-write
+    /// HeadObject here (that's the redundant call the handler already made).
     async fn store(
         &self,
         hash: &str,

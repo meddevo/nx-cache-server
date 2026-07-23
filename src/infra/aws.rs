@@ -315,9 +315,10 @@ impl StorageProvider for S3Storage {
         hash: &str,
         mut data: ReaderStream<impl AsyncRead + Send + Unpin>,
     ) -> Result<(), StorageError> {
-        if self.exists(hash).await? {
-            return Err(StorageError::AlreadyExists);
-        }
+        // No existence pre-check here: the handler already did one HeadObject
+        // (see server/handlers.rs `store_artifact`). Content-addressed keys make
+        // a racing double-write byte-identical, so we skip the redundant call
+        // and the TOCTOU window it pretended to close.
 
         // Fill one part's worth of the body before deciding how to upload it.
         // Bodies that fit in a single part use plain PutObject; larger bodies
