@@ -59,11 +59,12 @@ impl Slot {
     /// exact Mode B condition: if S3 stalls toward the 30s timeout, every
     /// arrival during the stall still coalesces onto the one in-flight probe
     /// instead of starting a fresh one each TTL window.
-    fn live(&self) -> bool {
+    fn live(&self, now: Instant) -> bool {
+        let age = now.saturating_duration_since(self.created);
         match self.present.get() {
             None => true,
-            Some(true) => self.created.elapsed() < POSITIVE_TTL,
-            Some(false) => self.created.elapsed() < NEGATIVE_TTL,
+            Some(true) => age < POSITIVE_TTL,
+            Some(false) => age < NEGATIVE_TTL,
         }
     }
 }
@@ -91,34 +92,39 @@ impl ProbeCache {
     /// subsequent GETs on this instance skip the HeadObject (and never see a
     /// stale cached 404 from a pre-write probe). Overwrites any existing slot.
     pub fn mark_present(&self, hash: &str) {
+        let now = Instant::now();
         let present = OnceCell::new();
-        let _ = present.set(true); // fresh cell, set is infallible
-        let slot = Arc::new(Slot {
-            present,
-            created: Instant::now(),
-        });
-        self.slots
-            .lock()
-            .expect("probe cache mutex poisoned")
-            .insert(hash.to_string(), slot);
+        present.set(true).expect("fresh cell is never initialised");
+        let slot = Arc::new(Slot { present, created: now });
+        let mut slots = self.slots.lock().expect("probe cache mutex poisoned");
+        Self::sweep(&mut slots, now);
+        slots.insert(hash.to_string(), slot);
     }
 
     fn slot(&self, hash: &str) -> Arc<Slot> {
+        let now = Instant::now();
         let mut slots = self.slots.lock().expect("probe cache mutex poisoned");
         if let Some(existing) = slots.get(hash) {
-            if existing.live() {
+            if existing.live(now) {
                 return existing.clone();
             }
         }
-        if slots.len() > SWEEP_THRESHOLD {
-            slots.retain(|_, s| s.live());
-        }
+        Self::sweep(&mut slots, now);
         let slot = Arc::new(Slot {
             present: OnceCell::new(),
-            created: Instant::now(),
+            created: now,
         });
         slots.insert(hash.to_string(), slot.clone());
         slot
+    }
+
+    /// Drop expired/resolved slots once the map grows past the cap. Called on
+    /// both the probe path (`slot`) and the write path (`mark_present`) so
+    /// neither can grow the map without bound.
+    fn sweep(slots: &mut HashMap<String, Arc<Slot>>, now: Instant) {
+        if slots.len() > SWEEP_THRESHOLD {
+            slots.retain(|_, s| s.live(now));
+        }
     }
 }
 
@@ -179,6 +185,33 @@ mod tests {
         assert_eq!(cache.present("abc", probe).await, Err(()));
         assert_eq!(cache.present("abc", probe).await, Err(()));
         assert_eq!(calls.load(Ordering::SeqCst), 2, "a failed probe must be retried, not cached");
+    }
+
+    #[test]
+    fn live_applies_asymmetric_ttl_by_outcome() {
+        // Build slots at a fixed `created` and probe `live()` at now = created +
+        // age. Add via `+` (never underflows) so this is clock-independent.
+        let base = Instant::now();
+        let mk = |value: Option<bool>| {
+            let present = OnceCell::new();
+            if let Some(v) = value {
+                present.set(v).unwrap();
+            }
+            Slot { present, created: base }
+        };
+        let at = |secs| base + Duration::from_secs(secs);
+
+        // In-flight (unresolved) stays live regardless of age - keeps a stalling
+        // probe coalesced.
+        assert!(mk(None).live(at(3600)));
+        // Absent expires fast (NEGATIVE_TTL = 5s).
+        assert!(mk(Some(false)).live(at(2)));
+        assert!(!mk(Some(false)).live(at(30)));
+        // Present is trusted long (POSITIVE_TTL = 60s) but not forever. The
+        // at(30) case is what catches an accidental arm swap: it would fail if
+        // present used the 5s negative TTL.
+        assert!(mk(Some(true)).live(at(30)));
+        assert!(!mk(Some(true)).live(at(120)));
     }
 
     #[tokio::test]
