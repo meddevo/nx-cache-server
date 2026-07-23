@@ -10,10 +10,17 @@
 //! - **Single-flight**: concurrent probes for the same hash share one S3 call
 //!   (`tokio::sync::OnceCell::get_or_try_init` runs the closure once; the rest
 //!   await it). Handles the simultaneous salvo a plain TTL cache can't.
-//! - **TTL cache**: the result (present *or* absent) is reused for `TTL`.
-//!   Handles the repeated re-probes across the burst window. Keys are
-//!   content-addressed, so a cached "present" can't go stale within seconds;
-//!   a cached "absent" self-heals after TTL when the artifact is later written.
+//! - **TTL cache**: the result is reused for a TTL that differs by outcome.
+//!   Keys are content-addressed (immutable), so a `present=true` result is safe
+//!   to trust for a long while (`POSITIVE_TTL`) - it only saves a repeat
+//!   HeadObject on hot keys. A `present=false` result is the staleness risk (a
+//!   key absent now may be written a moment later), so it's kept short
+//!   (`NEGATIVE_TTL`); a stale 404 is just a cache miss (Nx recomputes), never
+//!   wrong data, and self-heals at TTL.
+//! - **Seed on write**: a successful PUT calls [`ProbeCache::mark_present`],
+//!   overwriting any cached `false` so same-instance GETs see the new artifact
+//!   immediately instead of waiting out the negative TTL. (Only same-instance:
+//!   with >1 task, the other task's cache still self-heals via NEGATIVE_TTL.)
 //!
 //! An S3 error is not cached - `get_or_try_init` leaves the cell uninitialised
 //! so the next caller retries.
@@ -24,10 +31,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 
-/// How long a presence result is trusted. A few seconds is enough to swallow a
-/// CI burst while keeping a just-written artifact visible almost immediately.
-// ponytail: a const, not an env knob - make it configurable when tuning needs it.
-const TTL: Duration = Duration::from_secs(5);
+/// How long an *absent* result is trusted. Short: a key can be written moments
+/// after being probed missing, and this bounds that stale-404 window.
+// ponytail: consts, not env knobs - make configurable when tuning needs it.
+const NEGATIVE_TTL: Duration = Duration::from_secs(5);
+
+/// How long a *present* result is trusted. Long is safe because keys are
+/// content-addressed and immutable; the only way it goes stale is a delete
+/// (rare, lifecycle-scale), which degrades harmlessly to a retrieve()->404.
+const POSITIVE_TTL: Duration = Duration::from_secs(60);
 
 /// Cap on retained slots. A resolved slot lingers until it's re-probed (which
 /// replaces it) or a sweep fires, so a long tail of never-again-probed keys
@@ -41,13 +53,18 @@ struct Slot {
 }
 
 impl Slot {
-    /// Usable while its result is still fresh, or while its probe is still in
-    /// flight (unresolved). Keeping an unresolved slot alive past TTL matters
-    /// under the exact Mode B condition: if S3 stalls toward the 30s timeout,
-    /// every arrival during the stall still coalesces onto the one in-flight
-    /// probe instead of starting a fresh one each TTL window.
+    /// Usable while its result is still fresh (present/absent have different
+    /// TTLs, see the consts), or while its probe is still in flight
+    /// (unresolved). Keeping an unresolved slot alive past TTL matters under the
+    /// exact Mode B condition: if S3 stalls toward the 30s timeout, every
+    /// arrival during the stall still coalesces onto the one in-flight probe
+    /// instead of starting a fresh one each TTL window.
     fn live(&self) -> bool {
-        self.present.get().is_none() || self.created.elapsed() < TTL
+        match self.present.get() {
+            None => true,
+            Some(true) => self.created.elapsed() < POSITIVE_TTL,
+            Some(false) => self.created.elapsed() < NEGATIVE_TTL,
+        }
     }
 }
 
@@ -58,8 +75,8 @@ pub struct ProbeCache {
 
 impl ProbeCache {
     /// Returns whether `hash` exists, coalescing concurrent callers and caching
-    /// the answer for `TTL`. `probe` performs the real (single) existence check
-    /// and only runs on a cache miss.
+    /// the answer (per-outcome TTL). `probe` performs the real (single)
+    /// existence check and only runs on a cache miss.
     pub async fn present<F, Fut, E>(&self, hash: &str, probe: F) -> Result<bool, E>
     where
         F: FnOnce() -> Fut,
@@ -68,6 +85,22 @@ impl ProbeCache {
         let slot = self.slot(hash);
         // First caller runs `probe`; concurrent callers await the same future.
         slot.present.get_or_try_init(probe).await.copied()
+    }
+
+    /// Record that `hash` now exists - called after a successful write so
+    /// subsequent GETs on this instance skip the HeadObject (and never see a
+    /// stale cached 404 from a pre-write probe). Overwrites any existing slot.
+    pub fn mark_present(&self, hash: &str) {
+        let present = OnceCell::new();
+        let _ = present.set(true); // fresh cell, set is infallible
+        let slot = Arc::new(Slot {
+            present,
+            created: Instant::now(),
+        });
+        self.slots
+            .lock()
+            .expect("probe cache mutex poisoned")
+            .insert(hash.to_string(), slot);
     }
 
     fn slot(&self, hash: &str) -> Arc<Slot> {
@@ -146,5 +179,33 @@ mod tests {
         assert_eq!(cache.present("abc", probe).await, Err(()));
         assert_eq!(cache.present("abc", probe).await, Err(()));
         assert_eq!(calls.load(Ordering::SeqCst), 2, "a failed probe must be retried, not cached");
+    }
+
+    #[tokio::test]
+    async fn mark_present_seeds_a_hit_without_probing() {
+        let cache = ProbeCache::default();
+        cache.mark_present("abc");
+        let calls = AtomicUsize::new(0);
+        let present = cache
+            .present("abc", || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<bool, ()>(false)
+            })
+            .await;
+        assert_eq!(present, Ok(true), "seeded key must read present");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "seeded key must not probe S3");
+    }
+
+    #[tokio::test]
+    async fn mark_present_overrides_a_cached_absent() {
+        // The PUT-mid-burst case: a key probed absent, then written. Seeding
+        // must clear the stale 404 so the next GET on this instance sees it.
+        let cache = ProbeCache::default();
+        assert_eq!(cache.present("abc", || async { Ok::<bool, ()>(false) }).await, Ok(false));
+        cache.mark_present("abc");
+        let present = cache
+            .present("abc", || async { Ok::<bool, ()>(false) })
+            .await;
+        assert_eq!(present, Ok(true), "seed must override the cached absent");
     }
 }

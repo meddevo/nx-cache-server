@@ -24,6 +24,7 @@ pub async fn store_artifact<T: StorageProvider>(
         // Reading the body to completion first lets the client finish before we
         // close. The key is content-addressed, so the duplicate we're
         // discarding is byte-identical to what's already stored.
+        state.probe.mark_present(&hash);
         drain_body(body).await;
         return Ok((StatusCode::CONFLICT, "Cannot override an existing record"));
     }
@@ -46,6 +47,9 @@ pub async fn store_artifact<T: StorageProvider>(
     let reader_stream = tokio_util::io::ReaderStream::new(reader);
 
     state.storage.store(&hash, reader_stream).await?;
+    // Seed the probe cache so same-instance GETs skip the HeadObject and never
+    // read a stale 404 left by a probe that ran before this write.
+    state.probe.mark_present(&hash);
 
     Ok((StatusCode::ACCEPTED, ""))
 }

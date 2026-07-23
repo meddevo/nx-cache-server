@@ -294,6 +294,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_seeds_cache_so_next_get_is_a_hit() {
+        // Storage reports exists=No, so a cold GET would 404. After a PUT seeds
+        // the probe cache (mark_present), the next GET on the same instance must
+        // read the key as present (200) - the PUT-mid-burst stale-404 fix.
+        // Both oneshots share one AppState (probe is Arc), so the seed carries.
+        let app = app(MockStorage::new(ExistsBehavior::No));
+        let put = app
+            .clone()
+            .oneshot(
+                Request::put("/v1/cache/abc123")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", RW_TOKEN))
+                    .body(Body::from("artifact bytes"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::ACCEPTED);
+
+        let get = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/cache/abc123")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", RO_TOKEN))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK, "seeded key must read as a hit, not 404");
+    }
+
+    #[tokio::test]
     async fn conflict_409_has_connection_close() {
         let response = app(MockStorage::new(ExistsBehavior::Yes))
             .oneshot(
