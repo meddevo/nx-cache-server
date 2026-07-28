@@ -23,7 +23,9 @@
 //!   with >1 task, the other task's cache still self-heals via NEGATIVE_TTL.)
 //!
 //! An S3 error is not cached - `get_or_try_init` leaves the cell uninitialised
-//! so the next caller retries.
+//! so the next caller retries. That uninitialised cell is also why an
+//! unresolved slot expires (`UNRESOLVED_TTL`) instead of living forever: see
+//! [`Slot::live`].
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -41,6 +43,13 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(5);
 /// (rare, lifecycle-scale), which degrades harmlessly to a retrieve()->404.
 const POSITIVE_TTL: Duration = Duration::from_secs(60);
 
+/// How long an *unresolved* slot is kept for coalescing. Must exceed the S3
+/// operation timeout (`S3_TIMEOUT`, default 30s) so a legitimately stalling
+/// probe still collects its followers; beyond that no probe can still be
+/// running, so the slot is garbage. See [`Slot::live`] for why the bound has to
+/// exist at all.
+const UNRESOLVED_TTL: Duration = Duration::from_secs(60);
+
 /// Cap on retained slots. A resolved slot lingers until it's re-probed (which
 /// replaces it) or a sweep fires, so a long tail of never-again-probed keys
 /// would otherwise grow the map unbounded. Past this size we drop everything
@@ -54,15 +63,25 @@ struct Slot {
 
 impl Slot {
     /// Usable while its result is still fresh (present/absent have different
-    /// TTLs, see the consts), or while its probe is still in flight
-    /// (unresolved). Keeping an unresolved slot alive past TTL matters under the
+    /// TTLs, see the consts), or while its probe is plausibly still in flight
+    /// (unresolved and younger than `UNRESOLVED_TTL`).
+    ///
+    /// Keeping an unresolved slot alive past the *result* TTLs matters under the
     /// exact Mode B condition: if S3 stalls toward the 30s timeout, every
     /// arrival during the stall still coalesces onto the one in-flight probe
-    /// instead of starting a fresh one each TTL window.
+    /// instead of starting a fresh one each TTL window. Keeping it alive
+    /// *forever* was a bug: `get_or_try_init` leaves the cell uninitialised when
+    /// the probe returns `Err`, and a caller cancelled mid-await (client
+    /// disconnect - routine here, since every response forces
+    /// `Connection: close`) strands it the same way. An unresolved slot that is
+    /// permanently `live` can never be evicted by [`ProbeCache::sweep`], so the
+    /// map grew monotonically with every failed or cancelled probe for the
+    /// lifetime of the process - which the module's own "neither can grow the
+    /// map without bound" claim denied. Bounding it makes that claim true.
     fn live(&self, now: Instant) -> bool {
         let age = now.saturating_duration_since(self.created);
         match self.present.get() {
-            None => true,
+            None => age < UNRESOLVED_TTL,
             Some(true) => age < POSITIVE_TTL,
             Some(false) => age < NEGATIVE_TTL,
         }
@@ -201,9 +220,12 @@ mod tests {
         };
         let at = |secs| base + Duration::from_secs(secs);
 
-        // In-flight (unresolved) stays live regardless of age - keeps a stalling
-        // probe coalesced.
-        assert!(mk(None).live(at(3600)));
+        // In-flight (unresolved) stays live long enough to outlast a stalling S3
+        // probe (30s operation timeout) so the burst keeps coalescing...
+        assert!(mk(None).live(at(45)));
+        // ...but not forever: a slot stranded by a failed or cancelled probe
+        // must become sweepable, or the map leaks for the process lifetime.
+        assert!(!mk(None).live(at(120)));
         // Absent expires fast (NEGATIVE_TTL = 5s).
         assert!(mk(Some(false)).live(at(2)));
         assert!(!mk(Some(false)).live(at(30)));
@@ -212,6 +234,35 @@ mod tests {
         // present used the 5s negative TTL.
         assert!(mk(Some(true)).live(at(30)));
         assert!(!mk(Some(true)).live(at(120)));
+    }
+
+    #[test]
+    fn sweep_reclaims_slots_stranded_by_a_failed_probe() {
+        // `get_or_try_init` leaves the cell uninitialised on error, so a failed
+        // (or cancelled) probe leaves an unresolved slot behind. While those were
+        // permanently `live`, `retain` could never drop them and the map grew
+        // monotonically for the process lifetime. Build a map past the sweep
+        // threshold entirely out of such slots and prove they now go away.
+        let base = Instant::now();
+        let mut slots: HashMap<String, Arc<Slot>> = (0..=SWEEP_THRESHOLD)
+            .map(|i| {
+                let slot = Slot {
+                    present: OnceCell::new(),
+                    created: base,
+                };
+                (i.to_string(), Arc::new(slot))
+            })
+            .collect();
+
+        ProbeCache::sweep(&mut slots, base + Duration::from_secs(30));
+        assert_eq!(
+            slots.len(),
+            SWEEP_THRESHOLD + 1,
+            "a probe that could still be in flight must not be swept"
+        );
+
+        ProbeCache::sweep(&mut slots, base + Duration::from_secs(120));
+        assert!(slots.is_empty(), "stranded unresolved slots must be reclaimable");
     }
 
     #[tokio::test]
