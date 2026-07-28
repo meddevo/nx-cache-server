@@ -10,7 +10,9 @@ path = "src/bin/aws.rs"
 
 [dependencies]
 # Core dependencies
-tokio = { version = "1.0", features = ["rt-multi-thread", "net", "io-util", "macros", "sync"] }
+# "time" is for the S3 self-probe ticker in server/mod.rs. It was previously
+# reaching us only transitively via the AWS SDK; declare it, don't rely on that.
+tokio = { version = "1.0", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
 tokio-stream = "0.1"
 axum = "0.8"
 # Layer to force `Connection: close` (see server/mod.rs).

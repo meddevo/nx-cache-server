@@ -13,7 +13,17 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::set_header::SetResponseHeaderLayer;
+
+/// How often the self-probe checks that S3 is still reachable.
+const SELF_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Key the self-probe HeadObjects. It contains a `.`, which
+/// [`validation::validate_hash`] rejects, so no client can create it through the
+/// API — the probe therefore always exercises the cheap "absent" path: one
+/// HeadObject returning 404, never a GetObject.
+const SELF_PROBE_KEY: &str = "_selfprobe.nx-cache-server";
 
 #[derive(Clone)]
 pub struct AppState<T: StorageProvider> {
@@ -52,6 +62,32 @@ pub fn create_router<T: StorageProvider + Clone>(app_state: &AppState<T>) -> Rou
         ))
 }
 
+/// One S3 reachability check, logged with its duration.
+///
+/// Every other signal this server produces is request-driven, so a task that
+/// loses its ability to reach S3 while CI is idle leaves no trace at all until
+/// the next build. That blind spot is exactly what makes the observed
+/// degradation ambiguous: one long-lived task produced thousands of 30s S3
+/// timeouts while its freshly-started peers produced none, and we cannot tell
+/// whether onset needs burst traffic or just uptime. This ticks regardless of
+/// traffic and timestamps it.
+///
+/// Failures need no logging here: `exists()` already emits the structured
+/// `S3 operation failed` ERROR line that the CloudWatch alarm counts (see
+/// infra/aws.rs). Note the probe alone cannot *trip* that alarm — at one call a
+/// minute it can contribute at most 5 errors per 5-minute period against a
+/// threshold of 20 — so an idle-window onset is recorded for the morning, not
+/// paged on. That is the intended trade for a dev CI cache.
+async fn self_probe_once<T: StorageProvider>(storage: &T) {
+    let start = std::time::Instant::now();
+    let outcome = storage.exists(SELF_PROBE_KEY).await;
+    tracing::info!(
+        duration_ms = start.elapsed().as_millis(),
+        reachable = outcome.is_ok(),
+        "s3 self-probe"
+    );
+}
+
 pub async fn run_server<T: StorageProvider + Clone>(
     storage: T,
     config: &ServerConfig,
@@ -61,6 +97,17 @@ pub async fn run_server<T: StorageProvider + Clone>(
         config: Arc::new(config.clone()),
         probe: Arc::new(ProbeCache::default()),
     };
+
+    // Synthetic S3 probe, independent of request traffic. `interval` fires its
+    // first tick immediately, so there's a reachability line from startup.
+    let probe_storage = app_state.storage.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(SELF_PROBE_INTERVAL);
+        loop {
+            ticker.tick().await;
+            self_probe_once(probe_storage.as_ref()).await;
+        }
+    });
 
     let app = create_router::<T>(&app_state).with_state(app_state);
     let addr = std::net::SocketAddr::new(config.bind_address, config.port);
@@ -202,6 +249,23 @@ mod tests {
         );
         let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
         assert!(!body.is_empty(), "Nx rejects bodyless 401/403 responses");
+    }
+
+    #[tokio::test]
+    async fn self_probe_key_is_unreachable_through_the_api() {
+        // The probe relies on its key never existing, so it always takes the
+        // cheap HeadObject-404 path. That holds only while no client can create
+        // it — `.` is outside validate_hash's charset.
+        assert!(validation::validate_hash(SELF_PROBE_KEY).is_err());
+    }
+
+    #[tokio::test]
+    async fn self_probe_runs_against_healthy_and_failing_storage() {
+        // Guards the wiring, not the logging: the probe must complete either way
+        // and must never panic on a task that has lost S3 (it runs unattended
+        // overnight, and a panicking spawned task would silence it permanently).
+        self_probe_once(&MockStorage::new(ExistsBehavior::No)).await;
+        self_probe_once(&MockStorage::new(ExistsBehavior::Fail)).await;
     }
 
     #[tokio::test]
