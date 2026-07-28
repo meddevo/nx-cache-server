@@ -215,6 +215,21 @@ impl S3Storage {
             StorageError::OperationFailed
         })?;
 
+        // The GET probe cache holds an unresolved slot for a fixed
+        // UNRESOLVED_TTL so a stalling probe keeps coalescing its followers. An
+        // operation timeout longer than that silently defeats it, so check the
+        // invariant here (where the configurable value lives) rather than
+        // asserting it in a comment next to the const.
+        let unresolved_ttl = crate::server::probe_cache::UNRESOLVED_TTL;
+        if std::time::Duration::from_secs(config.timeout_seconds) > unresolved_ttl {
+            tracing::warn!(
+                s3_timeout_seconds = config.timeout_seconds,
+                unresolved_ttl_seconds = unresolved_ttl.as_secs(),
+                "S3_TIMEOUT exceeds the probe cache's unresolved-slot TTL; a stalling \
+                 HeadObject will stop coalescing concurrent GETs for the same key"
+            );
+        }
+
         let mut s3_config_builder = S3Config::builder()
             .behavior_version_latest()
             .http_client(https_client())

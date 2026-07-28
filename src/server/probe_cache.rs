@@ -48,7 +48,13 @@ const POSITIVE_TTL: Duration = Duration::from_secs(60);
 /// probe still collects its followers; beyond that no probe can still be
 /// running, so the slot is garbage. See [`Slot::live`] for why the bound has to
 /// exist at all.
-const UNRESOLVED_TTL: Duration = Duration::from_secs(60);
+///
+/// This is a const while the timeout is configurable, so the invariant is only
+/// checked — not enforced — at startup by
+/// [`crate::infra::aws::S3Storage::new`]. Raising `S3_TIMEOUT` past this evicts
+/// slots mid-probe, which breaks coalescing under exactly the stall it exists
+/// for (harmless otherwise: awaiting callers hold their own `Arc<Slot>`).
+pub(crate) const UNRESOLVED_TTL: Duration = Duration::from_secs(60);
 
 /// Cap on retained slots. A resolved slot lingers until it's re-probed (which
 /// replaces it) or a sweep fires, so a long tail of never-again-probed keys
