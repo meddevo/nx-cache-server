@@ -15,7 +15,14 @@ pub async fn store_artifact<T: StorageProvider>(
 ) -> Result<impl IntoResponse, ServerError> {
     validation::validate_hash(&hash)?;
 
-    if state.storage.exists(&hash).await? {
+    // A failed existence probe must not 500 - see `retrieve_artifact` for why a
+    // 5xx from this server is disproportionately expensive. We don't know
+    // whether the key is there, so take the honest branch and store it: keys are
+    // content-addressed, so re-writing bytes that may already be present is a
+    // byte-identical no-op. 409 is still returned when `exists` actually said
+    // yes (no deviation from the Nx immutability contract), and a genuine 500
+    // now means only one thing: the write itself failed.
+    if state.storage.exists(&hash).await.unwrap_or(false) {
         // Drain the request body before responding. Every response forces
         // `Connection: close` (the 502 fix): answering 409 while the client is
         // still uploading closes the socket under it, so reqwest reports
@@ -67,11 +74,31 @@ pub async fn retrieve_artifact<T: StorageProvider>(
     // cache collapses that to ~one HeadObject per key per TTL. A confirmed-
     // present key then streams via GetObject as before (hits are ~4%, so the
     // extra HeadObject on the hit path is negligible).
-    if !state.probe.present(&hash, || state.storage.exists(&hash)).await? {
+    //
+    // A read that fails is answered 404, never 500: a failed cache read *is* a
+    // cache miss, and the two are not symmetric in cost. Nx handles 404 by
+    // recomputing the task (it already does, for ~96% of reads); a 500 makes it
+    // abort the whole run as a misconfigured endpoint (nrwl/nx#36107) even after
+    // every task succeeded. In dytab's `nx run <app>:serve` step that is
+    // unrecoverable - the failing build is spawned *inside* the serve executor,
+    // so the CI tolerance guard has no exit code to launder, the executor parks
+    // in watch mode, and the service never boots. Worst case here: we recompute
+    // an artifact we already had. Errors are still logged at ERROR with the
+    // operation and AWS request_id in infra/aws.rs - alarm on those, not on 5xx.
+    let present = state
+        .probe
+        .present(&hash, || state.storage.exists(&hash))
+        .await
+        .unwrap_or(false);
+    if !present {
         return Err(ServerError::Storage(StorageError::NotFound));
     }
 
-    let reader = state.storage.retrieve(&hash).await?;
+    let reader = state
+        .storage
+        .retrieve(&hash)
+        .await
+        .map_err(|_| ServerError::Storage(StorageError::NotFound))?;
     let stream = tokio_util::io::ReaderStream::new(reader);
     let body = Body::from_stream(stream);
 

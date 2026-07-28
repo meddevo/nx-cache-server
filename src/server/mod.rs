@@ -103,6 +103,8 @@ mod tests {
     #[derive(Clone)]
     struct MockStorage {
         exists: ExistsBehavior,
+        store_fails: bool,
+        retrieve_fails: bool,
         store_calls: Arc<AtomicUsize>,
     }
 
@@ -110,8 +112,20 @@ mod tests {
         fn new(exists: ExistsBehavior) -> Self {
             Self {
                 exists,
+                store_fails: false,
+                retrieve_fails: false,
                 store_calls: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        fn failing_store(mut self) -> Self {
+            self.store_fails = true;
+            self
+        }
+
+        fn failing_retrieve(mut self) -> Self {
+            self.retrieve_fails = true;
+            self
         }
     }
 
@@ -131,6 +145,9 @@ mod tests {
             _data: ReaderStream<impl AsyncRead + Send + Unpin>,
         ) -> Result<(), StorageError> {
             self.store_calls.fetch_add(1, Ordering::SeqCst);
+            if self.store_fails {
+                return Err(StorageError::OperationFailed);
+            }
             Ok(())
         }
 
@@ -138,6 +155,9 @@ mod tests {
             &self,
             _hash: &str,
         ) -> Result<Box<dyn AsyncRead + Send + Unpin>, StorageError> {
+            if self.retrieve_fails {
+                return Err(StorageError::OperationFailed);
+            }
             Ok(Box::new(std::io::Cursor::new(b"artifact".to_vec())))
         }
     }
@@ -341,8 +361,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_failure_500_has_connection_close() {
-        let response = app(MockStorage::new(ExistsBehavior::Fail))
+    async fn put_stores_when_the_existence_probe_fails() {
+        // A failed HeadObject used to 500 the PUT. We can't tell whether the key
+        // is there, so store it: content-addressed keys make a duplicate write
+        // byte-identical. Only a failed `store` is a real 500 now.
+        let storage = MockStorage::new(ExistsBehavior::Fail);
+        let store_calls = storage.store_calls.clone();
+        let response = app(storage)
+            .oneshot(
+                Request::put("/v1/cache/abc123")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", RW_TOKEN))
+                    .body(Body::from("artifact bytes"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_connection_close(&response);
+        assert_eq!(store_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn write_failure_500_has_connection_close() {
+        // The one remaining 5xx: the write itself failed, so Nx must not believe
+        // the artifact was accepted.
+        let response = app(MockStorage::new(ExistsBehavior::No).failing_store())
             .oneshot(
                 Request::put("/v1/cache/abc123")
                     .header(header::AUTHORIZATION, format!("Bearer {}", RW_TOKEN))
@@ -352,6 +395,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_connection_close(&response);
+    }
+
+    #[tokio::test]
+    async fn get_probe_failure_is_a_miss_not_a_500() {
+        // A read that fails IS a cache miss. Nx recomputes on 404; on 500 it
+        // aborts the whole run as a misconfigured endpoint (nrwl/nx#36107),
+        // which is unrecoverable in the `<app>:serve` CI step.
+        let response = app(MockStorage::new(ExistsBehavior::Fail))
+            .oneshot(
+                Request::get("/v1/cache/abc123")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", RO_TOKEN))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_connection_close(&response);
+    }
+
+    #[tokio::test]
+    async fn get_retrieve_failure_is_a_miss_not_a_500() {
+        // Same rule one step later: the key probed present but GetObject failed.
+        let response = app(MockStorage::new(ExistsBehavior::Yes).failing_retrieve())
+            .oneshot(
+                Request::get("/v1/cache/abc123")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", RO_TOKEN))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_connection_close(&response);
     }
 
