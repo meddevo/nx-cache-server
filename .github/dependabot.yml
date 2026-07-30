@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # ponytail: security-only — we don't want churn PRs for every minor bump
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
