@@ -247,6 +247,16 @@ impl S3Storage {
                 TimeoutConfig::builder()
                     .operation_timeout(std::time::Duration::from_secs(config.timeout_seconds))
                     .operation_attempt_timeout(std::time::Duration::from_secs(10))
+                    // The SDK sets NO connect timeout by default, so a hung DNS
+                    // lookup or TCP connect is bounded only by the attempt
+                    // timeout above and surfaces as an anonymous
+                    // `kind: Operation, duration: 30s` error - which is exactly
+                    // the signature of the recurring per-task S3 wedge whose
+                    // cause has escaped five investigations. With this set, the
+                    // same hang becomes a typed ConnectorError naming DNS vs
+                    // connect vs TLS, and requests fail in ~11s instead of 30
+                    // (or 60 on the PUT path, which does exists() then store()).
+                    .connect_timeout(std::time::Duration::from_secs(3))
                     .build(),
             );
 
