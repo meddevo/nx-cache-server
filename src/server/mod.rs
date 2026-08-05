@@ -854,6 +854,40 @@ mod tests {
         );
     }
 
+    /// What makes the hardcoded method list above a guard rather than a wish:
+    /// every method the table does *not* cover has to be a 405. Adding a method
+    /// to the router without adding rows for it turns its 405 into something
+    /// else, and fails here.
+    #[tokio::test]
+    async fn methods_outside_the_table_are_rejected() {
+        let covered: std::collections::HashSet<_> =
+            all_cases().iter().map(|case| case.method).collect();
+        for method in ["DELETE", "PATCH", "OPTIONS", "TRACE"] {
+            if covered.contains(&method) {
+                continue;
+            }
+            let response = app(MockStorage::new(ExistsBehavior::Yes))
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("/v1/cache/{VALID_HASH}"))
+                        // The write token, so this is a routing answer and not an
+                        // auth one.
+                        .header(header::AUTHORIZATION, format!("Bearer {RW_TOKEN}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} is routed somewhere but has no rows in all_cases(), so nothing \
+                 decides what it answers or whether it drains"
+            );
+        }
+    }
+
     /// `every_response_drains_the_body` proves the body was consumed; only a real
     /// socket proves the consequence - that the client finishes its upload and
     /// reads the status instead of a broken pipe. One test carries that claim,
