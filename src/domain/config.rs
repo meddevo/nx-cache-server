@@ -139,7 +139,6 @@ pub struct ServerConfig {
 
     #[arg(long, env = "DEBUG", help = "Enable debug logging")]
     pub debug: bool,
-
     // NOTE: normal operation should never need debug logging. The server is
     // designed so `RUST_LOG=nx_cache_server=info` is sufficient to diagnose
     // any 4xx/5xx from a single log line (structured operation/hash/S3

@@ -120,7 +120,10 @@ impl ProbeCache {
         let now = Instant::now();
         let present = OnceCell::new();
         present.set(true).expect("fresh cell is never initialised");
-        let slot = Arc::new(Slot { present, created: now });
+        let slot = Arc::new(Slot {
+            present,
+            created: now,
+        });
         let mut slots = self.slots.lock().expect("probe cache mutex poisoned");
         Self::sweep(&mut slots, now);
         slots.insert(hash.to_string(), slot);
@@ -183,7 +186,11 @@ mod tests {
         for h in handles {
             assert_eq!(h.await.unwrap(), Ok(false));
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "single-flight must collapse the burst to one probe");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "single-flight must collapse the burst to one probe"
+        );
     }
 
     #[tokio::test]
@@ -196,7 +203,11 @@ mod tests {
         };
         assert_eq!(cache.present("abc", probe).await, Ok(true));
         assert_eq!(cache.present("abc", probe).await, Ok(true));
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "second probe within TTL must hit the cache");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second probe within TTL must hit the cache"
+        );
     }
 
     #[tokio::test]
@@ -209,7 +220,11 @@ mod tests {
         };
         assert_eq!(cache.present("abc", probe).await, Err(()));
         assert_eq!(cache.present("abc", probe).await, Err(()));
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "a failed probe must be retried, not cached");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a failed probe must be retried, not cached"
+        );
     }
 
     #[test]
@@ -222,7 +237,10 @@ mod tests {
             if let Some(v) = value {
                 present.set(v).unwrap();
             }
-            Slot { present, created: base }
+            Slot {
+                present,
+                created: base,
+            }
         };
         let at = |secs| base + Duration::from_secs(secs);
 
@@ -268,7 +286,10 @@ mod tests {
         );
 
         ProbeCache::sweep(&mut slots, base + Duration::from_secs(120));
-        assert!(slots.is_empty(), "stranded unresolved slots must be reclaimable");
+        assert!(
+            slots.is_empty(),
+            "stranded unresolved slots must be reclaimable"
+        );
     }
 
     #[tokio::test]
@@ -283,7 +304,11 @@ mod tests {
             })
             .await;
         assert_eq!(present, Ok(true), "seeded key must read present");
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "seeded key must not probe S3");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "seeded key must not probe S3"
+        );
     }
 
     #[tokio::test]
@@ -291,7 +316,12 @@ mod tests {
         // The PUT-mid-burst case: a key probed absent, then written. Seeding
         // must clear the stale 404 so the next GET on this instance sees it.
         let cache = ProbeCache::default();
-        assert_eq!(cache.present("abc", || async { Ok::<bool, ()>(false) }).await, Ok(false));
+        assert_eq!(
+            cache
+                .present("abc", || async { Ok::<bool, ()>(false) })
+                .await,
+            Ok(false)
+        );
         cache.mark_present("abc");
         let present = cache
             .present("abc", || async { Ok::<bool, ()>(false) })
