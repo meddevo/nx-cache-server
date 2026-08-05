@@ -235,14 +235,42 @@ impl S3Storage {
             .http_client(https_client())
             .region(region)
             .credentials_provider(config.clone())
-            // Adaptive retry mode self-heals transient S3 blips (throttling,
-            // 5xx, socket resets) inside the SDK instead of surfacing them to
-            // nx as a fatal build error. operation_attempt_timeout bounds a
-            // single attempt (~10s); operation_timeout (below, per-call) is
-            // the overall per-S3-call budget - each UploadPart/PutObject call
-            // gets its own budget, so large artifacts aren't capped by a
-            // single 10s window across the whole multipart upload.
-            .retry_config(RetryConfig::adaptive().with_max_attempts(3))
+            // Retries still self-heal transient S3 blips (5xx, socket resets)
+            // inside the SDK instead of surfacing them to nx as a fatal build
+            // error. operation_attempt_timeout bounds a single attempt (~10s);
+            // operation_timeout (below, per-call) is the overall per-S3-call
+            // budget - each UploadPart/PutObject call gets its own budget, so
+            // large artifacts aren't capped by a single 10s window across the
+            // whole multipart upload.
+            //
+            // `standard`, NOT `adaptive`: adaptive additionally installs a
+            // process-wide client-side rate limiter, and that limiter is the
+            // leading suspect for the recurring per-task S3 wedge (six
+            // incidents, 2026-07-20..08-05: every S3 call on one task times out
+            // at exactly operation_timeout while peer tasks are healthy, curing
+            // only on task replacement). In aws-smithy-runtime 1.9.2,
+            // `ClientRateLimiter::acquire_permission_to_send_a_request`
+            // subtracts the token cost *outside* the allow/deny branch, so a
+            // denied request is charged and never refunded; capacity therefore
+            // goes unboundedly negative under concurrency and the computed
+            // `sleep_time = (amount - capacity) / fill_rate` grows without
+            // bound. That sleep happens in the orchestrator *before* the attempt
+            // loop - inside operation_timeout but outside both
+            // operation_attempt_timeout and connect_timeout - which is exactly
+            // our signature: an anonymous `kind: Operation` timeout with no DNS
+            // lookup, no socket, no blocking-pool thread and no ConnectorError.
+            // The limiter is inert until one response classifies as
+            // ThrottlingError and then latches on for the process lifetime,
+            // which is why only long-lived tasks are ever hit.
+            //
+            // Nothing here needs adaptive: this workload has never logged a
+            // SlowDown/throttle, so the case adaptive was added for has not
+            // occurred, while the failure it plausibly causes has occurred six
+            // times. `standard` is the SDK default and is also what upstream
+            // nxcite/nx-cache-server uses (it sets no retry_config at all);
+            // adaptive arrived here as a rider on the multipart-storage
+            // adoption in 941cd0a, not as a considered choice.
+            .retry_config(RetryConfig::standard().with_max_attempts(3))
             .timeout_config(
                 TimeoutConfig::builder()
                     .operation_timeout(std::time::Duration::from_secs(config.timeout_seconds))
