@@ -6,6 +6,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use std::time::Duration;
 use tokio_stream::StreamExt;
 
 pub async fn store_artifact<T: StorageProvider>(
@@ -13,7 +14,13 @@ pub async fn store_artifact<T: StorageProvider>(
     State(state): State<AppState<T>>,
     body: Body,
 ) -> Result<impl IntoResponse, ServerError> {
-    validation::validate_hash(&hash)?;
+    if let Err(invalid) = validation::validate_hash(&hash) {
+        // Drain first, same as the 409 below: the client is still uploading when
+        // we reject the key, and answering with its body unread closes the socket
+        // under it - it would see a write error instead of this 400.
+        drain_body(body).await;
+        return Err(invalid);
+    }
 
     // A failed existence probe must not 500 - see `retrieve_artifact` for why a
     // 5xx from this server is disproportionately expensive. We don't know
@@ -113,14 +120,46 @@ pub async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "OK")
 }
 
+/// How long we go on reading a body we already know we're discarding. A CI
+/// client uploading an artifact finishes in seconds; past this it is either
+/// pathologically slow or trickling bytes to hold the connection open. Draining
+/// is a courtesy to the client, so it must not become a way for one to pin a
+/// connection indefinitely - the server has no other request timeout.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Read and discard a request body to completion so the client finishes its
 /// upload before we close the (forced `Connection: close`) socket. A read error
 /// means the client already went away - nothing left to drain.
-async fn drain_body(body: Body) {
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        if chunk.is_err() {
-            break;
+pub(crate) async fn drain_body(body: Body) {
+    drain_body_within(body, DRAIN_TIMEOUT).await;
+}
+
+/// Split out so tests can bound it in milliseconds instead of waiting a minute.
+/// Giving up just restores the old behaviour for that one client (it sees a write
+/// error rather than the status), which is the point: bounded courtesy.
+async fn drain_body_within(body: Body, limit: Duration) {
+    let _ = tokio::time::timeout(limit, async move {
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            if chunk.is_err() {
+                break;
+            }
         }
+    })
+    .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unbounded drain would let one authenticated client hold a connection
+    /// open forever by never finishing its upload.
+    #[tokio::test]
+    async fn drain_gives_up_on_a_body_that_never_ends() {
+        let never_ends =
+            Body::from_stream(tokio_stream::pending::<Result<Vec<u8>, std::io::Error>>());
+        // Returns, rather than hanging the suite.
+        drain_body_within(never_ends, Duration::from_millis(50)).await;
     }
 }

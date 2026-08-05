@@ -137,10 +137,11 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::AsyncRead;
+    use tokio_stream::StreamExt as _;
     use tokio_util::io::ReaderStream;
     use tower::ServiceExt;
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum ExistsBehavior {
         No,
         Yes,
@@ -189,12 +190,18 @@ mod tests {
         async fn store(
             &self,
             _hash: &str,
-            _data: ReaderStream<impl AsyncRead + Send + Unpin>,
+            data: ReaderStream<impl AsyncRead + Send + Unpin>,
         ) -> Result<(), StorageError> {
             self.store_calls.fetch_add(1, Ordering::SeqCst);
             if self.store_fails {
+                // Fails without reading, like a rejected CreateMultipartUpload.
                 return Err(StorageError::OperationFailed);
             }
+            // Read the stream to the end like the real S3 multipart upload does.
+            // A mock that drops the body instead makes every "did we consume the
+            // request body" assertion vacuous - see `every_response_drains_the_body`.
+            let mut reader = tokio_util::io::StreamReader::new(data);
+            let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
             Ok(())
         }
 
@@ -247,7 +254,9 @@ mod tests {
             "text/plain",
             "Nx requires text/plain on 401/403"
         );
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert!(!body.is_empty(), "Nx rejects bodyless 401/403 responses");
     }
 
@@ -281,7 +290,11 @@ mod tests {
     #[tokio::test]
     async fn missing_token_401_has_connection_close_and_text_plain_body() {
         let response = app(MockStorage::new(ExistsBehavior::No))
-            .oneshot(Request::get("/v1/cache/abc123").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/v1/cache/abc123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -406,7 +419,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(get.status(), StatusCode::OK, "seeded key must read as a hit, not 404");
+        assert_eq!(
+            get.status(),
+            StatusCode::OK,
+            "seeded key must read as a hit, not 404"
+        );
     }
 
     #[tokio::test]
@@ -509,6 +526,400 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_connection_close(&response);
+    }
+
+    /// A request body whose consumption is observable: the counter advances only
+    /// when a chunk is actually polled out of it. A response sent while chunks
+    /// remain means the body was dropped unread - over a real socket that reaches
+    /// the client as a write error instead of the status we meant to send, which
+    /// is why `oneshot` + `Body::from("bytes")` cannot see this class of bug at
+    /// all (it silently discards whatever the handler didn't read).
+    fn counted_body(chunks: usize) -> (Body, Arc<AtomicUsize>) {
+        let read = Arc::new(AtomicUsize::new(0));
+        let counter = read.clone();
+        let stream = tokio_stream::iter(0..chunks).map(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok::<Vec<u8>, std::io::Error>(vec![0u8; 1024])
+        });
+        (Body::from_stream(stream), read)
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    enum Token {
+        Rw,
+        Ro,
+        Wrong,
+        None,
+    }
+
+    /// Must the request body be read to completion before we answer? An
+    /// exception has to name the client it hangs up on and why that's acceptable,
+    /// so the decision shows up in review instead of being forgotten.
+    #[derive(Clone, Copy)]
+    enum Drain {
+        Required,
+        NotRequired(&'static str),
+    }
+
+    struct Case {
+        method: &'static str,
+        hash: &'static str,
+        token: Token,
+        exists: ExistsBehavior,
+        store_fails: bool,
+        status: StatusCode,
+        drain: Drain,
+    }
+
+    const VALID_HASH: &str = "abc123";
+    const INVALID_HASH: &str = "bad.hash!";
+    /// 32 KiB in 1 KiB chunks. Size is irrelevant in-process (no socket buffers
+    /// involved); >1 chunk is all that's needed to tell "read it all" from
+    /// "dropped it".
+    const BODY_CHUNKS: usize = 32;
+
+    fn all_cases() -> Vec<Case> {
+        let ok = |method, token, status, drain| Case {
+            method,
+            hash: VALID_HASH,
+            token,
+            exists: ExistsBehavior::Yes,
+            store_fails: false,
+            status,
+            drain,
+        };
+        let unauthenticated = "an unauthenticated caller is owed nothing; reading a body \
+             before deciding whether the caller may speak at all would let anyone \
+             make us read";
+        vec![
+            // --- the method x token cross-product (see cross_product_is_covered) ---
+            ok("GET", Token::Rw, StatusCode::OK, Drain::Required),
+            ok("GET", Token::Ro, StatusCode::OK, Drain::Required),
+            ok(
+                "GET",
+                Token::Wrong,
+                StatusCode::UNAUTHORIZED,
+                Drain::NotRequired(unauthenticated),
+            ),
+            ok(
+                "GET",
+                Token::None,
+                StatusCode::UNAUTHORIZED,
+                Drain::NotRequired(unauthenticated),
+            ),
+            // HEAD is a read, and axum routes it to the GET handler - the
+            // read-only token must not be refused it.
+            ok("HEAD", Token::Rw, StatusCode::OK, Drain::Required),
+            ok("HEAD", Token::Ro, StatusCode::OK, Drain::Required),
+            ok(
+                "HEAD",
+                Token::Wrong,
+                StatusCode::UNAUTHORIZED,
+                Drain::NotRequired(unauthenticated),
+            ),
+            ok(
+                "HEAD",
+                Token::None,
+                StatusCode::UNAUTHORIZED,
+                Drain::NotRequired(unauthenticated),
+            ),
+            // The CREEP refusal. The client is mid-upload when we decide, so the
+            // 403 only reaches it if we take the upload to completion first.
+            Case {
+                method: "PUT",
+                hash: VALID_HASH,
+                token: Token::Ro,
+                exists: ExistsBehavior::No,
+                store_fails: false,
+                status: StatusCode::FORBIDDEN,
+                drain: Drain::Required,
+            },
+            Case {
+                method: "PUT",
+                hash: VALID_HASH,
+                token: Token::Rw,
+                exists: ExistsBehavior::No,
+                store_fails: false,
+                status: StatusCode::ACCEPTED,
+                drain: Drain::Required,
+            },
+            ok(
+                "PUT",
+                Token::Wrong,
+                StatusCode::UNAUTHORIZED,
+                Drain::NotRequired(unauthenticated),
+            ),
+            ok(
+                "PUT",
+                Token::None,
+                StatusCode::UNAUTHORIZED,
+                Drain::NotRequired(unauthenticated),
+            ),
+            // `route_layer` does run on a method mismatch, so auth answers first
+            // and a read-only POST is a 403 (drained) rather than a 405.
+            ok(
+                "POST",
+                Token::Rw,
+                StatusCode::METHOD_NOT_ALLOWED,
+                Drain::NotRequired(
+                    "axum's built-in 405, which we never see the body of. Reaching it \
+                     needs the write token and a method no Nx client sends, so it buys \
+                     a `method_not_allowed_fallback` handler nothing",
+                ),
+            ),
+            ok("POST", Token::Ro, StatusCode::FORBIDDEN, Drain::Required),
+            ok(
+                "POST",
+                Token::Wrong,
+                StatusCode::UNAUTHORIZED,
+                Drain::NotRequired(unauthenticated),
+            ),
+            ok(
+                "POST",
+                Token::None,
+                StatusCode::UNAUTHORIZED,
+                Drain::NotRequired(unauthenticated),
+            ),
+            // --- the remaining response classes a body-carrying PUT can reach ---
+            // Write-once refusal: same mid-upload timing as the 403.
+            ok("PUT", Token::Rw, StatusCode::CONFLICT, Drain::Required),
+            // Rejected before the body is even looked at.
+            Case {
+                method: "PUT",
+                hash: INVALID_HASH,
+                token: Token::Rw,
+                exists: ExistsBehavior::No,
+                store_fails: false,
+                status: StatusCode::BAD_REQUEST,
+                drain: Drain::Required,
+            },
+            // Auth precedes validation, so a read-only token sees 403, not 400.
+            Case {
+                method: "PUT",
+                hash: INVALID_HASH,
+                token: Token::Ro,
+                exists: ExistsBehavior::No,
+                store_fails: false,
+                status: StatusCode::FORBIDDEN,
+                drain: Drain::Required,
+            },
+            // A failed existence probe stores anyway (content-addressed keys).
+            Case {
+                method: "PUT",
+                hash: VALID_HASH,
+                token: Token::Rw,
+                exists: ExistsBehavior::Fail,
+                store_fails: false,
+                status: StatusCode::ACCEPTED,
+                drain: Drain::Required,
+            },
+            Case {
+                method: "PUT",
+                hash: VALID_HASH,
+                token: Token::Rw,
+                exists: ExistsBehavior::No,
+                store_fails: true,
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                drain: Drain::NotRequired(
+                    "the body was moved into the storage layer, so the handler no \
+                     longer owns it and cannot drain the remainder; a failed \
+                     multipart upload abandons it. Nx treats any 5xx as a fatal \
+                     misconfigured-endpoint anyway, so the client is lost either way",
+                ),
+            },
+            // GET/HEAD carry no body, so draining is trivially satisfied; these
+            // rows are here for the status assertions.
+            Case {
+                method: "GET",
+                hash: VALID_HASH,
+                token: Token::Ro,
+                exists: ExistsBehavior::No,
+                store_fails: false,
+                status: StatusCode::NOT_FOUND,
+                drain: Drain::Required,
+            },
+            Case {
+                method: "HEAD",
+                hash: VALID_HASH,
+                token: Token::Ro,
+                exists: ExistsBehavior::No,
+                store_fails: false,
+                status: StatusCode::NOT_FOUND,
+                drain: Drain::Required,
+            },
+        ]
+    }
+
+    /// Deciding a response without reading the request body closes the connection
+    /// under a client that is still uploading, so it never sees the status. This
+    /// is the whole bug class in one table: every response the cache route can
+    /// produce for a body-carrying request must consume that body first, or carry
+    /// a written-down reason for not doing so.
+    #[tokio::test]
+    async fn every_response_drains_the_body() {
+        let mut failures = Vec::new();
+
+        for case in all_cases() {
+            let mut storage = MockStorage::new(case.exists);
+            if case.store_fails {
+                storage = storage.failing_store();
+            }
+            let carries_body = matches!(case.method, "PUT" | "POST");
+            let (body, read) = if carries_body {
+                counted_body(BODY_CHUNKS)
+            } else {
+                (Body::empty(), Arc::new(AtomicUsize::new(0)))
+            };
+
+            let mut request = Request::builder()
+                .method(case.method)
+                .uri(format!("/v1/cache/{}", case.hash));
+            match case.token {
+                Token::Rw => {
+                    request = request.header(header::AUTHORIZATION, format!("Bearer {RW_TOKEN}"))
+                }
+                Token::Ro => {
+                    request = request.header(header::AUTHORIZATION, format!("Bearer {RO_TOKEN}"))
+                }
+                Token::Wrong => request = request.header(header::AUTHORIZATION, "Bearer nope"),
+                Token::None => {}
+            }
+
+            let label = format!(
+                "{} /v1/cache/{} as {:?} (exists={:?}, store_fails={})",
+                case.method, case.hash, case.token, case.exists, case.store_fails
+            );
+            let response = app(storage)
+                .oneshot(request.body(body).unwrap())
+                .await
+                .unwrap();
+
+            if response.status() != case.status {
+                failures.push(format!(
+                    "{label}: expected {}, got {}",
+                    case.status,
+                    response.status()
+                ));
+                continue;
+            }
+            assert_connection_close(&response);
+
+            if carries_body {
+                let chunks_read = read.load(Ordering::SeqCst);
+                match case.drain {
+                    Drain::Required if chunks_read < BODY_CHUNKS => failures.push(format!(
+                        "{label}: answered {} after reading only {chunks_read}/{BODY_CHUNKS} \
+                         body chunks - the client would see a write error, not the status",
+                        case.status
+                    )),
+                    // Hanging up on a mid-upload client has to be a decision
+                    // someone wrote down, not an oversight that reads the same.
+                    Drain::NotRequired(reason) => assert!(
+                        !reason.is_empty(),
+                        "{label}: answering without draining needs a stated reason"
+                    ),
+                    Drain::Required => {}
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "{} case(s) failed:\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
+    }
+
+    /// The table above is only as good as its coverage. A new method or a new
+    /// token class cannot be added without a row deciding what it answers and
+    /// whether it drains.
+    #[tokio::test]
+    async fn cross_product_is_covered() {
+        let covered: std::collections::HashSet<_> = all_cases()
+            .iter()
+            .map(|case| (case.method, case.token))
+            .collect();
+        let mut missing = Vec::new();
+        for method in ["GET", "HEAD", "PUT", "POST"] {
+            for token in [Token::Rw, Token::Ro, Token::Wrong, Token::None] {
+                if !covered.contains(&(method, token)) {
+                    missing.push(format!("{method} as {token:?}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "uncovered method/token pairs: {missing:?}"
+        );
+    }
+
+    /// `every_response_drains_the_body` proves the body was consumed; only a real
+    /// socket proves the consequence - that the client finishes its upload and
+    /// reads the status instead of a broken pipe. One test carries that claim,
+    /// with a body far larger than the socket buffers so the response is
+    /// necessarily decided mid-upload.
+    #[tokio::test]
+    async fn read_only_put_reaches_the_client_as_403_over_a_real_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let state = AppState {
+            storage: Arc::new(MockStorage::new(ExistsBehavior::No)),
+            config: Arc::new(ServerConfig {
+                port: 0,
+                bind_address: "127.0.0.1".parse().unwrap(),
+                service_access_token: RW_TOKEN.to_string(),
+                read_only_access_token: Some(RO_TOKEN.to_string()),
+                debug: false,
+            }),
+            probe: Arc::new(ProbeCache::default()),
+        };
+        let app = create_router(&state).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        const BODY_LEN: usize = 8 * 1024 * 1024;
+        // Bounded so a drain that never terminates fails the suite instead of
+        // hanging it.
+        let exchange = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "PUT /v1/cache/{VALID_HASH} HTTP/1.1\r\nHost: localhost\r\n\
+                         Authorization: Bearer {RO_TOKEN}\r\n\
+                         Content-Length: {BODY_LEN}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let chunk = vec![0u8; 64 * 1024];
+            let mut sent = 0;
+            while sent < BODY_LEN {
+                socket
+                    .write_all(&chunk)
+                    .await
+                    .expect("connection closed while the client was still uploading");
+                sent += chunk.len();
+            }
+
+            let mut status_line = String::new();
+            BufReader::new(socket)
+                .read_line(&mut status_line)
+                .await
+                .unwrap();
+            status_line
+        })
+        .await
+        .expect("the exchange must finish, not hang");
+
+        assert!(
+            exchange.starts_with("HTTP/1.1 403"),
+            "expected a 403 status line, got: {exchange}"
+        );
     }
 
     #[tokio::test]
