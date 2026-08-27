@@ -65,7 +65,11 @@ pub async fn store_artifact<T: StorageProvider>(
     // read a stale 404 left by a probe that ran before this write.
     state.probe.mark_present(&hash);
 
-    Ok((StatusCode::ACCEPTED, ""))
+    // 200, not 202: the Nx client matches PUT success against exactly
+    // StatusCode::OK. Anything else is a "Misconfigured remote cache endpoint"
+    // error that makes Nx retry the upload into the 409 path above - every
+    // write transferred the artifact twice (upstream PR #23).
+    Ok((StatusCode::OK, ""))
 }
 
 pub async fn retrieve_artifact<T: StorageProvider>(

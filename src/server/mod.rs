@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_write_token_put_202_has_connection_close_and_stores() {
+    async fn read_write_token_put_200_has_connection_close_and_stores() {
         let storage = MockStorage::new(ExistsBehavior::No);
         let store_calls = storage.store_calls.clone();
         let response = app(storage)
@@ -385,7 +385,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.status(), StatusCode::OK);
         assert_connection_close(&response);
         assert_eq!(store_calls.load(Ordering::SeqCst), 1);
     }
@@ -407,7 +407,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(put.status(), StatusCode::ACCEPTED);
+        assert_eq!(put.status(), StatusCode::OK);
 
         let get = app
             .clone()
@@ -457,7 +457,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.status(), StatusCode::OK);
         assert_connection_close(&response);
         assert_eq!(store_calls.load(Ordering::SeqCst), 1);
     }
@@ -640,7 +640,7 @@ mod tests {
                 token: Token::Rw,
                 exists: ExistsBehavior::No,
                 store_fails: false,
-                status: StatusCode::ACCEPTED,
+                status: StatusCode::OK,
                 drain: Drain::Required,
             },
             ok(
@@ -710,7 +710,7 @@ mod tests {
                 token: Token::Rw,
                 exists: ExistsBehavior::Fail,
                 store_fails: false,
-                status: StatusCode::ACCEPTED,
+                status: StatusCode::OK,
                 drain: Drain::Required,
             },
             Case {
