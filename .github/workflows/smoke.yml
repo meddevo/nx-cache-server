@@ -1,0 +1,135 @@
+name: Nx smoke test
+
+# Runs a real Nx client against the built server: write on a cold cache, then a
+# remote hit after the local cache is wiped. Unit tests pin what the server
+# does; this job pins what the Nx client *accepts* — the contract lives in Nx's
+# http_remote_cache.rs, not in the OpenAPI doc (which said 202 while the client
+# required 200; nrwl/nx#32870, upstream PR #23). nx@latest on purpose: client
+# drift is what this job exists to catch, hence also the weekly schedule —
+# Nx releases don't wait for pushes to this repo.
+on:
+  push:
+    branches: [master, meddevo-integration]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    # Same arm64 runner as test.yml/docker.yml: free on public repos, and the
+    # architecture the image actually ships for.
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        # Previous major (pinned - bump when a new Nx major ships), current
+        # stable, and the prerelease channel. latest/next are dist-tags and
+        # track forward on their own.
+        nx-version: ["22", "latest", "next"]
+    # A broken prerelease isn't ours to fix and must not block PRs; it still
+    # shows up in the run list as the early warning this job exists for.
+    continue-on-error: ${{ matrix.nx-version == 'next' }}
+    env:
+      NX_SELF_HOSTED_REMOTE_CACHE_SERVER: http://127.0.0.1:3000
+      NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN: smoke-test-token
+      NX_DAEMON: "false"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # One cargo cache for all matrix jobs - the build is identical.
+          shared-key: smoke
+
+      - name: Start MinIO and create the bucket
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          curl -sf --retry 30 --retry-delay 1 --retry-all-errors http://127.0.0.1:9000/minio/health/live
+          docker run --rm --network host --entrypoint sh minio/mc -c \
+            "mc alias set m http://127.0.0.1:9000 minioadmin minioadmin && mc mb m/nx-cache"
+
+      - name: Build and start the cache server
+        env:
+          SERVICE_ACCESS_TOKEN: smoke-test-token
+          READ_ONLY_ACCESS_TOKEN: smoke-read-only-token
+          S3_BUCKET_NAME: nx-cache
+          S3_ENDPOINT_URL: http://127.0.0.1:9000
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          RUST_LOG: nx_cache_server=info
+        run: |
+          cargo build --bin nx-cache-aws
+          nohup target/debug/nx-cache-aws > server.log 2>&1 &
+          curl -sf --retry 30 --retry-delay 1 --retry-all-errors http://127.0.0.1:3000/health
+
+      - name: Create a minimal Nx workspace
+        run: |
+          mkdir -p /tmp/ws/packages/app
+          cd /tmp/ws
+          echo '{ "name": "smoke", "private": true }' > package.json
+          echo '{}' > nx.json
+          cat > packages/app/project.json <<'EOF'
+          {
+            "name": "app",
+            "targets": {
+              "build": {
+                "executor": "nx:run-commands",
+                "options": { "command": "mkdir -p packages/app/dist && echo built > packages/app/dist/out.txt" },
+                "cache": true,
+                "outputs": ["{projectRoot}/dist"]
+              }
+            }
+          }
+          EOF
+          npm install nx@${{ matrix.nx-version }}
+          npx nx --version
+
+      - name: 'Run 1: cold cache, task runs and is stored remotely'
+        working-directory: /tmp/ws
+        run: npx nx build app
+
+      - name: 'Run 2: local cache wiped, must be served from the remote'
+        working-directory: /tmp/ws
+        run: |
+          rm -rf .nx packages/app/dist
+          npx nx build app
+          test -f packages/app/dist/out.txt
+
+      - name: 'Run 3: read-only token - write refused with 403, task still succeeds'
+        working-directory: /tmp/ws
+        env:
+          NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN: smoke-read-only-token
+        run: |
+          # New command -> new hash -> nx recomputes and tries to store it. The
+          # server must refuse the write (CREEP mitigation: untrusted PR builds
+          # get the read-only token) and nx must treat that 403 as "not stored,
+          # carry on" - the task itself has to succeed.
+          sed -i 's/echo built/echo built-v2/' packages/app/project.json
+          rm -rf .nx packages/app/dist
+          npx nx build app
+          test -f packages/app/dist/out.txt
+
+      - name: Assert the protocol exchange in the server's access log
+        run: |
+          cat server.log
+          # Exactly two PUTs across all runs: run 1's store (200) and run 3's
+          # refused write (403). Any other PUT means the client rejected a
+          # response and retried (the 202-vs-200 incident: retry lands on the
+          # write-once 409) or run 2 recomputed instead of hitting the cache.
+          puts=$(grep -c 'method=PUT' server.log)
+          test "$puts" -eq 2 || { echo "expected exactly 2 PUTs, saw $puts"; exit 1; }
+          test "$(grep 'method=PUT' server.log | grep -c 'status=200')" -eq 1
+          test "$(grep 'method=PUT' server.log | grep -c 'status=403')" -eq 1
+          # Run 2's remote hit: at least one artifact GET answered 200.
+          grep 'method=GET' server.log | grep '/v1/cache/' | grep -q 'status=200'
