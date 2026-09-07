@@ -57,10 +57,38 @@ pub async fn store_artifact<T: StorageProvider>(
     let body_stream = body
         .into_data_stream()
         .map(|chunk| chunk.map_err(std::io::Error::other));
-    let reader = tokio_util::io::StreamReader::new(body_stream);
-    let reader_stream = tokio_util::io::ReaderStream::new(reader);
+    let mut reader = tokio_util::io::StreamReader::new(body_stream);
+    // Lend the reader rather than move it, so a failed store leaves the unread
+    // remainder here to drain (the storage layer reads one part before its
+    // first S3 call, so small artifacts are already consumed by then).
+    let reader_stream = tokio_util::io::ReaderStream::new(&mut reader);
 
-    state.storage.store(&hash, reader_stream).await?;
+    match state.storage.store(&hash, reader_stream).await {
+        Ok(()) => {}
+        // The client went away mid-upload; nobody is listening for the answer.
+        Err(StorageError::ClientAbort) => return Err(StorageError::ClientAbort.into()),
+        // A failed write is answered 403, not 500. Nx's `store()` treats 403
+        // (like 409) as "server declined, carry on" and returns Ok(false);
+        // anything else is "Misconfigured remote cache endpoint", which
+        // `cache.put` retries 6 times (re-uploading the artifact each time) and
+        // then rejects, marking the task that just *succeeded* as failed. The
+        // only cost of the 403 is a later cache miss for this hash. 200 would
+        // also work but would make "200 in the access log" stop meaning
+        // "bytes are in S3". Logged at ERROR in infra/aws.rs at the failure.
+        Err(e) => {
+            tracing::error!(
+                hash,
+                "cache STORE declined (storage failed: {e}); answering 403 so Nx keeps the task green"
+            );
+            let _ = tokio::time::timeout(
+                DRAIN_TIMEOUT,
+                tokio::io::copy(&mut reader, &mut tokio::io::sink()),
+            )
+            .await;
+            // Same 403 the read-only token gets: exact `text/plain`, as Nx checks.
+            return Err(ServerError::Forbidden);
+        }
+    }
     // Seed the probe cache so same-instance GETs skip the HeadObject and never
     // read a stale 404 left by a probe that ran before this write.
     state.probe.mark_present(&hash);

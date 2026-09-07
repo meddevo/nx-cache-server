@@ -148,6 +148,7 @@ At INFO level you get:
 - **One access-log line per request** (method, path, status, `duration_ms`, and `bytes` when a `Content-Length` is set) - so you can always tell whether/when/how a request finished.
 - **One structured error line per failure**, carrying `operation` (`head`/`get`/`put`/`multipart-create`/`multipart-part`/`multipart-complete`/`multipart-abort`), the cache object hash, and the AWS SDK's own request id(s) plus the full error detail - enough to open an AWS support case or match logs to an S3-side incident without re-running anything at debug.
 - **Client-side aborts are logged at `WARN`, not `ERROR`**, and answered with `400 Bad Request` instead of `500`. A client disconnecting or resetting mid-upload is not a server failure and must not page anyone or count toward server error budgets.
+- **A failed write is answered `403 Forbidden`, not `500`.** Nx treats 403 (like 409) as "server declined, carry on" and keeps the task green; any 5xx is retried six times, re-uploading the artifact each time, and then fails the task that just succeeded. The cost is one later cache miss for that hash. The S3 failure itself is still logged at `ERROR`; alert on that line, not on the status code.
 
 Run with, e.g.:
 

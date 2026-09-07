@@ -463,9 +463,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_failure_500_has_connection_close() {
-        // The one remaining 5xx: the write itself failed, so Nx must not believe
-        // the artifact was accepted.
+    async fn write_failure_is_a_403_decline_not_a_500() {
+        // A failed write must not 500: Nx's store() takes 403 as "declined,
+        // carry on" (Ok(false)) but retries any 5xx six times and then marks the
+        // task - which already succeeded - as failed.
         let response = app(MockStorage::new(ExistsBehavior::No).failing_store())
             .oneshot(
                 Request::put("/v1/cache/abc123")
@@ -475,8 +476,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_connection_close(&response);
+        assert_text_plain_nonempty_body(response).await;
     }
 
     #[tokio::test]
@@ -713,19 +715,17 @@ mod tests {
                 status: StatusCode::OK,
                 drain: Drain::Required,
             },
+            // A failed write is declined with 403 (Nx: Ok(false), task stays
+            // green). The reader is only lent to the storage layer, so whatever
+            // it left unread is drained here - the 403 has to reach the client.
             Case {
                 method: "PUT",
                 hash: VALID_HASH,
                 token: Token::Rw,
                 exists: ExistsBehavior::No,
                 store_fails: true,
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                drain: Drain::NotRequired(
-                    "the body was moved into the storage layer, so the handler no \
-                     longer owns it and cannot drain the remainder; a failed \
-                     multipart upload abandons it. Nx treats any 5xx as a fatal \
-                     misconfigured-endpoint anyway, so the client is lost either way",
-                ),
+                status: StatusCode::FORBIDDEN,
+                drain: Drain::Required,
             },
             // GET/HEAD carry no body, so draining is trivially satisfied; these
             // rows are here for the status assertions.
