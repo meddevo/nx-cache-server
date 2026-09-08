@@ -25,7 +25,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::domain::{
     config::{ConfigError, ConfigValidator},
-    storage::{StorageError, StorageProvider},
+    storage::{StorageError, StorageProvider, PROBE_KEY},
 };
 
 /// S3 multipart part size. Parts below this go through a single PutObject;
@@ -298,6 +298,33 @@ impl S3Storage {
         let s3_config = s3_config_builder.build();
 
         let client = Client::from_conf(s3_config);
+
+        // Prove the bucket is writable before serving. A missing s3:PutObject
+        // or a bad credential otherwise surfaces only as 403s to Nx on every
+        // run (see server/handlers.rs), with nothing pointing at the server.
+        // Only a definite refusal (4xx) stops the boot: S3 being unreachable
+        // or 5xx-ing is what the SDK retries and the self-probe reports, and
+        // refusing to start then would turn an S3 blip during a task
+        // replacement into an ECS crash loop and a cache outage. The same key
+        // is overwritten in place on every start: one object, not one per boot.
+        if let Err(e) = client
+            .put_object()
+            .bucket(&config.bucket_name)
+            .key(PROBE_KEY)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                b"nx-cache-server startup probe",
+            ))
+            .send()
+            .await
+        {
+            log_s3_error("startup-probe", PROBE_KEY, &e);
+            if e.raw_response()
+                .is_some_and(|r| r.status().is_client_error())
+            {
+                return Err(StorageError::OperationFailed);
+            }
+            tracing::warn!("S3 not reachable at startup; serving anyway, the self-probe reports when it returns");
+        }
 
         Ok(Self {
             client,

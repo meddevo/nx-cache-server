@@ -4,7 +4,10 @@ pub mod middleware;
 pub mod probe_cache;
 pub mod validation;
 
-use crate::domain::{config::ServerConfig, storage::StorageProvider};
+use crate::domain::{
+    config::ServerConfig,
+    storage::{StorageProvider, PROBE_KEY},
+};
 use crate::server::probe_cache::ProbeCache;
 use axum::{
     http::{header::CONNECTION, HeaderValue},
@@ -18,12 +21,6 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 /// How often the self-probe checks that S3 is still reachable.
 const SELF_PROBE_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Key the self-probe HeadObjects. It contains a `.`, which
-/// [`validation::validate_hash`] rejects, so no client can create it through the
-/// API — the probe therefore always exercises the cheap "absent" path: one
-/// HeadObject returning 404, never a GetObject.
-const SELF_PROBE_KEY: &str = "_selfprobe.nx-cache-server";
 
 #[derive(Clone)]
 pub struct AppState<T: StorageProvider> {
@@ -80,7 +77,8 @@ pub fn create_router<T: StorageProvider + Clone>(app_state: &AppState<T>) -> Rou
 /// paged on. That is the intended trade for a dev CI cache.
 async fn self_probe_once<T: StorageProvider>(storage: &T) {
     let start = std::time::Instant::now();
-    let outcome = storage.exists(SELF_PROBE_KEY).await;
+    // One HeadObject of the object the startup probe wrote; never a GetObject.
+    let outcome = storage.exists(PROBE_KEY).await;
     tracing::info!(
         duration_ms = start.elapsed().as_millis(),
         reachable = outcome.is_ok(),
@@ -265,7 +263,7 @@ mod tests {
         // The probe relies on its key never existing, so it always takes the
         // cheap HeadObject-404 path. That holds only while no client can create
         // it — `.` is outside validate_hash's charset.
-        assert!(validation::validate_hash(SELF_PROBE_KEY).is_err());
+        assert!(validation::validate_hash(PROBE_KEY).is_err());
     }
 
     #[tokio::test]

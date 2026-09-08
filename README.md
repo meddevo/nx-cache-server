@@ -117,7 +117,7 @@ export SERVICE_ACCESS_TOKEN="my-secure-token"
 curl http://localhost:3000/health
 ```
 
-You should receive an "OK" response.
+You should receive an "OK" response. The server refuses to start if the bucket rejects a write (wrong IAM policy or credential), so that fails the deploy instead of every build; an unreachable S3 at startup is only logged.
 
 ### Client Configuration
 

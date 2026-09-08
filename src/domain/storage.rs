@@ -3,6 +3,11 @@ use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 
+/// Key of the object the startup probe writes and the self-probe HeadObjects.
+/// It contains a `.`, which `validate_hash` rejects, so no client can reach it
+/// through the API.
+pub const PROBE_KEY: &str = "_selfprobe.nx-cache-server";
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("Object not found")]
