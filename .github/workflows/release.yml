@@ -92,6 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
 
     steps:
       - name: Checkout code
@@ -105,3 +106,11 @@ jobs:
           version: ${{ needs.validate.outputs.version }}
           release-notes: ${{ github.event.inputs.release_notes }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The tag above is created with GITHUB_TOKEN, and GitHub never starts a
+      # workflow from an event made by that token, so docker.yml's `tags: v*`
+      # trigger does not fire for workflow releases. Dispatch it on the tag.
+      - name: Build and push the Docker image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run docker.yml --ref "${{ needs.validate.outputs.version }}"
