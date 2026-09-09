@@ -225,7 +225,6 @@ mod tests {
                 bind_address: "127.0.0.1".parse().unwrap(),
                 service_access_token: RW_TOKEN.to_string(),
                 read_only_access_token: Some(RO_TOKEN.to_string()),
-                debug: false,
             }),
             probe: Arc::new(ProbeCache::default()),
         };
@@ -902,7 +901,6 @@ mod tests {
                 bind_address: "127.0.0.1".parse().unwrap(),
                 service_access_token: RW_TOKEN.to_string(),
                 read_only_access_token: Some(RO_TOKEN.to_string()),
-                debug: false,
             }),
             probe: Arc::new(ProbeCache::default()),
         };

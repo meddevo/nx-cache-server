@@ -136,16 +136,6 @@ pub struct ServerConfig {
         help = "Optional bearer token granting read-only access. Give this one to untrusted CI jobs (e.g. PR builds) so they can use the cache but not write to it (CVE-2025-36852 / CREEP)"
     )]
     pub read_only_access_token: Option<String>,
-
-    #[arg(long, env = "DEBUG", help = "Enable debug logging")]
-    pub debug: bool,
-    // NOTE: normal operation should never need debug logging. The server is
-    // designed so `RUST_LOG=nx_cache_server=info` is sufficient to diagnose
-    // any 4xx/5xx from a single log line (structured operation/hash/S3
-    // request-id on errors, one access-log line per request) - see the
-    // README's "Observability & Diagnosability" section. Debug-level AWS SDK
-    // logging in particular is extremely high-volume and can rotate out of a
-    // log window within minutes on a busy server.
 }
 
 impl ConfigValidator for ServerConfig {
