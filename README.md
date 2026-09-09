@@ -4,7 +4,7 @@
 [![Nx smoke test](https://github.com/meddevo/nx-cache-server/actions/workflows/smoke.yml/badge.svg)](https://github.com/meddevo/nx-cache-server/actions/workflows/smoke.yml)
 [![Image](https://github.com/meddevo/nx-cache-server/actions/workflows/docker.yml/badge.svg)](https://github.com/meddevo/nx-cache-server/actions/workflows/docker.yml)
 
-A small Rust/Axum server that puts an S3 bucket behind the Nx self-hosted remote cache API. Single static binary, streams artifacts straight between the client and S3, a few MB of RAM.
+A small Rust/Axum server that puts an S3 bucket behind the Nx self-hosted remote cache API. Single binary, streams artifacts between the client and S3; memory is a baseline of a few MB plus one 8 MiB part buffer per in-flight upload.
 
 This is meddevo's fork of [nxcite/nx-cache-server](https://github.com/nxcite/nx-cache-server). Fixes that are not specific to our deployment go upstream as well; what stays here is what we learned running it behind an ALB on ECS:
 
@@ -14,9 +14,10 @@ This is meddevo's fork of [nxcite/nx-cache-server](https://github.com/nxcite/nx-
 - **Every 4xx/5xx is diagnosable at `RUST_LOG=nx_cache_server=info`.** No debug logging, ever.
 - **`Connection: close` on every response.** Kills the ALB keep-alive reuse race that produced sporadic 502s. Costs one TCP+TLS handshake per request, which is nothing for a CI cache.
 - **Bounded S3 calls**: 3s connect, 10s per attempt, 3 attempts, standard (not adaptive) retry mode.
+- **Coalesced existence checks on GET.** Concurrent misses for the same key share one `HeadObject`; results are cached 5s (absent) / 60s (present). See "Reads".
 - **Read-only token** for untrusted CI jobs (CREEP mitigation, also upstream).
 
-The contract this server implements is the Nx client, `packages/nx/src/native/cache/http_remote_cache.rs` in nrwl/nx, not the OpenAPI document (which said `202` for a stored artifact while the client required `200`). `smoke.yml` runs real Nx clients (previous major, `latest`, `next`) against the built server on every push and weekly, and fails if the client ever retries a write.
+The contract this server implements is the Nx client, `packages/nx/src/native/cache/http_remote_cache.rs` in nrwl/nx, not the OpenAPI document (which said `202` for a stored artifact while the client required `200`). `smoke.yml` runs real Nx clients (previous major, `latest`, `next`) against the built server on every push and weekly, and fails if the client ever retries a write (`next` is allowed to fail, so a broken prerelease shows up without blocking PRs).
 
 ## Running it
 
@@ -54,10 +55,13 @@ export S3_BUCKET_NAME="your-s3-bucket-name"
 export SERVICE_ACCESS_TOKEN="your-bearer-token"       # read-write token for trusted builds
 
 # Optional
-export READ_ONLY_ACCESS_TOKEN="your-ro-token"         # read-only token for untrusted CI jobs, see "Cache poisoning"
+export READ_ONLY_ACCESS_TOKEN="your-ro-token"         # read-only token for untrusted CI jobs, see "Cache poisoning".
+                                                      # Must differ from SERVICE_ACCESS_TOKEN and must not be empty; either is a startup error.
 export S3_ENDPOINT_URL="http://localhost:9000"        # S3-compatible services (MinIO etc.); enables path-style addressing
 export S3_TIMEOUT="30"                                # whole-operation timeout in seconds (default 30); connect is fixed
-                                                      # at 3s, one attempt at 10s, 3 attempts. Values above 60 log a warning.
+                                                      # at 3s, one attempt at 10s, 3 attempts. Values above 60 log a warning:
+                                                      # that is the GET probe cache's in-flight window (see "Reads"), and a
+                                                      # probe that outlives it stops coalescing concurrent GETs for its key.
 export PORT="3000"                                    # default 3000
 export BIND_ADDRESS="0.0.0.0"                         # default 0.0.0.0; "::" for IPv6/dual-stack
 export RUST_LOG="nx_cache_server=info"                # the only log level you should ever need
@@ -72,7 +76,7 @@ export AWS_SESSION_TOKEN="..."                        # temporary credentials on
 
 ### IAM
 
-The task role needs, on the cache bucket's objects:
+The task role needs, on the cache bucket's objects (`arn:aws:s3:::bucket/*`):
 
 ```
 s3:GetObject
@@ -80,7 +84,13 @@ s3:PutObject
 s3:AbortMultipartUpload
 ```
 
-`HeadObject` is covered by `s3:GetObject`; `CreateMultipartUpload`, `UploadPart` and `CompleteMultipartUpload` by `s3:PutObject`. A missing `s3:PutObject` is caught at startup (see below); a missing `s3:GetObject` shows up as every read being a `404` with an `AccessDenied` at `ERROR` next to it.
+and on the bucket itself (`arn:aws:s3:::bucket`):
+
+```
+s3:ListBucket
+```
+
+`HeadObject` on an existing key is covered by `s3:GetObject`; `CreateMultipartUpload`, `UploadPart` and `CompleteMultipartUpload` by `s3:PutObject`. `s3:ListBucket` is what makes `HeadObject` on a *missing* key answer `404` instead of `403`: without it the server cannot tell a miss from a denial, so every cache miss still answers `404` to Nx but also logs an `AccessDenied` at `ERROR`, and alerting on that line becomes useless. A missing `s3:PutObject` is caught at startup (see below); a missing `s3:GetObject` shows up as every read being a `404` with an `AccessDenied` at `ERROR` next to it.
 
 ### Startup and health
 
@@ -118,13 +128,27 @@ What the status codes mean, and why they are not what a generic HTTP server woul
 |---|---|---|
 | Artifact stored | `200` | The Nx client matches PUT success against exactly `200`. Anything else, including the OpenAPI doc's `202`, makes it re-upload. |
 | Key already present | `409` | Nx: "not stored, carry on". Body is drained first so the client does not see a reset socket. |
+| Missing or wrong token | `401` | With a `text/plain` body. Nx rejects a bodyless `401` as a misconfigured endpoint. |
 | Read-only token on PUT | `403` | Nx: "not stored, carry on". |
+| Hash not `[A-Za-z0-9_-]{1,128}` | `400` | Keeps the probe key and anything with a `/` or `.` out of reach. |
+| Method other than GET/HEAD/PUT | `405` | |
 | **S3 write failed** | `403` | Same as above. The alternative is a 5xx, which Nx retries six times (re-uploading each time) and then fails the task. Cost: one later cache miss. The S3 error is still at `ERROR`; alert on that line, not on the status. |
 | **S3 read failed** | `404` | A failed read is a cache miss. Nx recomputes on 404; on a 5xx it aborts the whole run as a misconfigured endpoint ([nrwl/nx#36107](https://github.com/nrwl/nx/issues/36107)). |
 | Existence check on PUT failed | store anyway | Keys are content-addressed, so a duplicate write is a byte-identical no-op. |
 | Client disconnected mid-upload | `400` | Not a server failure. |
 
-Every response carries `Connection: close`.
+Every response carries `Connection: close`. Because of that, any response decided while the client is still uploading (`400`, `403`, `409`) first reads the request body to its end, so the client sees the status and not a broken pipe. That drain is bounded at 60s; it is the server's only request-side timeout.
+
+## Reads: Existence Cache
+
+A CI burst probes the same missing keys over and over (one incident: 5,068 GET-404s over 154 keys), and each probe was a fresh S3 connection and DNS lookup. GET therefore goes through a per-key single-flight cache in front of `HeadObject`:
+
+- Concurrent GETs for the same key share one `HeadObject`. A probe still in flight keeps collecting followers for up to 60s, hence the `S3_TIMEOUT` warning above.
+- An *absent* result is trusted for 5s, a *present* one for 60s. Keys are content-addressed, so "present" cannot go stale except by deletion, which degrades to a `404`.
+- A successful PUT marks the key present on the same instance, so a GET right after it never sees a cached miss.
+- An S3 error is not cached; the next GET retries.
+
+The consequence to know about: with more than one task behind the ALB, a GET on task B can answer `404` for up to 5s after task A stored the key, if B probed that key missing just before. Nx recomputes the task; nothing is served wrong.
 
 ## Uploads: Multipart Streaming & S3 Lifecycle Cleanup
 
