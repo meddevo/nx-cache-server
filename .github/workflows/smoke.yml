@@ -49,14 +49,18 @@ jobs:
           # One cargo cache for all matrix jobs - the build is identical.
           shared-key: smoke
 
-      - name: Start MinIO and create the bucket
+      # versitygw, not MinIO: MinIO archived its community edition in 2026 and
+      # Docker Hub deleted the minio/ namespace. versitygw is Apache-2.0 and
+      # maintained; in its posix backend a bucket is just a directory, so no
+      # client image is needed to create one. Unauthenticated GET / is a 403,
+      # which is fine - curl only waits for the port to answer.
+      - name: Start versitygw and create the bucket
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
-          curl -sf --retry 30 --retry-delay 1 --retry-all-errors http://127.0.0.1:9000/minio/health/live
-          docker run --rm --network host --entrypoint sh minio/mc -c \
-            "mc alias set m http://127.0.0.1:9000 minioadmin minioadmin && mc mb m/nx-cache"
+          docker run -d --name s3 -p 9000:7070 -v s3data:/data \
+            -e ROOT_ACCESS_KEY=minioadmin -e ROOT_SECRET_KEY=minioadmin \
+            versity/versitygw:latest posix /data
+          docker exec s3 mkdir -p /data/nx-cache
+          curl -s --retry 30 --retry-delay 1 --retry-all-errors -o /dev/null http://127.0.0.1:9000/
 
       - name: Build and start the cache server
         env:
