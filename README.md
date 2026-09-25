@@ -43,7 +43,7 @@ cargo build --release --bin nx-cache-aws
 ./target/release/nx-cache-aws
 ```
 
-The release workflow (`release.yml`, manual dispatch) builds Linux, macOS and Windows binaries and attaches them to a GitHub release.
+The release workflow (`release.yml`, manual dispatch) builds Linux (static, musl), macOS and Windows binaries and attaches them to a GitHub release.
 
 ### Configuration
 
