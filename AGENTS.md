@@ -31,12 +31,19 @@ in the commit what Nx does with the new behaviour.
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+npm --prefix tests ci
+npm --prefix tests run format:check && npm --prefix tests run lint && npm --prefix tests run typecheck
+npm --prefix tests run test:offline
+npm --prefix tests run test:e2e   # needs Docker
 ```
 
-Router behaviour is tested in `src/server/mod.rs` with `tower::ServiceExt::oneshot`
-against in-memory storage mocks. Add a case there rather than a new harness.
-`smoke.yml` then runs real Nx clients against a MinIO-backed server on every
-push; a change to what Nx sees is not done until it passes.
+Behaviour visible over HTTP is tested black-box in `tests/` (upstream's Vitest
+suite, it runs the real binary). Add a case there: it is the only place
+upstream takes tests. What HTTP can't reach (error mapping, the probe cache)
+and fork-only behaviour stay Rust unit tests in `src/`. Upstream tests our
+fork fails by design are `test.skip`ped with a `meddevo fork:` comment.
+`smoke.yml` then runs real Nx clients against a versitygw-backed server on
+every push; a change to what Nx sees is not done until it passes.
 
 ## Commits
 
