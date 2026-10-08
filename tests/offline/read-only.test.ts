@@ -17,7 +17,10 @@ test("a read-only upload is received in full, then refused with 403", async () =
     expect(upload.status).toBe(403);
 });
 
-test("the connection stays usable after a read-only upload is refused", async () => {
+// meddevo fork: every response carries Connection: close (188768c, ALB keep-alive 502s),
+// so the connection is never reused.
+// oxlint-disable-next-line vitest/no-disabled-tests
+test.skip("the connection stays usable after a read-only upload is refused", async () => {
     const server = await startServer(VALID_ENV);
     const connection = new KeepAliveConnection(server.port);
     await connection.putStreaming(
