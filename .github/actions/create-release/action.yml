@@ -33,9 +33,10 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
+        # Through env, not ${{ }} in the script: interpolated text is shell code,
+        # and an apostrophe in the notes failed the first v1.6.1 run.
+        RELEASE_NOTES: ${{ inputs.release-notes }}
       run: |
-        # Sanitize release notes to prevent injection
-        RELEASE_NOTES='${{ inputs.release-notes }}'
         if [[ -z "$RELEASE_NOTES" ]]; then
           RELEASE_NOTES="Release ${{ inputs.version }}"
         fi
@@ -48,8 +49,7 @@ runs:
         else
           echo "🚀 Creating stable release: ${{ inputs.version }}"
         fi
-        
-        # Use heredoc to safely handle release notes with special characters
+
         gh release create "${{ inputs.version }}" --title "${{ inputs.version }}" --notes "$RELEASE_NOTES" $PRERELEASE_FLAG release-assets/*
 
     - name: Release Summary
