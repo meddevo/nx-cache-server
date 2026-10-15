@@ -56,9 +56,8 @@ where
         .and_then(|header| header.to_str().ok())
         .and_then(|auth_value| auth_value.strip_prefix("Bearer "));
 
-    // Return ServerError (not a bare StatusCode) so auth failures carry a
-    // text/plain body. Nx rejects a bodyless 401 with "Misconfigured remote
-    // cache endpoint: Requests should respond with text/plain on 401s."
+    // A `ServerError`, not a bare `StatusCode`, for the `text/plain` body Nx
+    // needs on a 401 (see error.rs).
     let token = match token {
         Some(t) => t,
         None => return Err(ServerError::Unauthorized),

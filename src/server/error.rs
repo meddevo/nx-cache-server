@@ -58,6 +58,10 @@ impl IntoResponse for ServerError {
             }
         };
 
+        // Exactly "text/plain", no "; charset=utf-8": on a 401 Nx compares the
+        // header byte for byte and otherwise reports "Requests should respond
+        // with text/plain on 401s" instead of the auth error
+        // (nrwl/nx packages/nx/src/native/cache/errors.rs, convert_response_to_error).
         (status, [("Content-Type", "text/plain")], message).into_response()
     }
 }
@@ -93,9 +97,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
-    // Nx rejects a bodyless 401/403 with "Misconfigured remote cache endpoint:
-    // Requests should respond with text/plain on 401s." Auth failures must carry
-    // a text/plain body, not a bare status - see server/middleware.rs.
     #[test]
     fn unauthorized_maps_to_401_text_plain() {
         let response = ServerError::Unauthorized.into_response();
